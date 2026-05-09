@@ -29,3 +29,6 @@ rand               = "0.8"
 portable-pty       = "0.8"
 vt100              = "0.15"
 chrono             = { version = "0.4", default-features = false, features = ["clock"] }
+tracing-appender   = "0.2"
+whoami             = "1"
+windows-sys        = { version = "0.59", features = ["Win32_System_Console"] }

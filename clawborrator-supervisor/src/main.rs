@@ -18,6 +18,15 @@
 // durable across renames while staying stable across daemon
 // restarts.
 
+// Release Windows builds: link as the GUI subsystem so Task Scheduler
+// (and double-clicks) don't pop a console window. Debug builds keep
+// the console subsystem so `cargo run` still works ergonomically.
+// Subcommands re-attach to the parent shell's console at runtime via
+// AttachConsole — see `attach_parent_console_if_any`.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
+mod autostart;
+mod logging;
 mod oauth;
 mod sessions;
 mod spawn;
@@ -27,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Instant};
@@ -64,6 +73,24 @@ struct Cli {
     /// config file at `~/.clawborrator/desktop_v1.json`).
     #[arg(long, env = "CLAWBORRATOR_MACHINE_ID")]
     machine_id: Option<String>,
+
+    /// No subcommand = run the daemon (default). Subcommands manage
+    /// the platform's autostart entry so the daemon launches at
+    /// user logon.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Register an autostart entry that launches this binary at
+    /// user logon. On Windows that's a per-user Task Scheduler
+    /// entry — no admin elevation needed.
+    InstallTask,
+    /// Remove the autostart entry. Idempotent.
+    UninstallTask,
+    /// Show whether the autostart entry is currently registered.
+    TaskStatus,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -481,15 +508,61 @@ async fn resolve_token(cli: &Cli, cfg: &mut Config) -> Result<String> {
     Ok(token)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
-        .init();
+/// Re-attach to the parent shell's console on Windows release builds
+/// so `eprintln!` / subcommand output reach the user. The release
+/// binary is `windows_subsystem = "windows"` (no console allocated by
+/// default) which is great for Task Scheduler launches but breaks
+/// `clawborrator-supervisor.exe install-task` invoked from PowerShell.
+/// AttachConsole(ATTACH_PARENT_PROCESS) silently no-ops if the parent
+/// has no console (e.g. Task Scheduler), so it's safe to always call.
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn attach_parent_console_if_any() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
+}
 
-    let cli = Cli::parse();
+#[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+fn attach_parent_console_if_any() {}
 
+fn run_subcommand(cmd: Command) -> Result<()> {
+    let provider = autostart::current();
+    match cmd {
+        Command::InstallTask   => install_task(provider),
+        Command::UninstallTask => uninstall_task(provider),
+        Command::TaskStatus    => task_status(provider),
+    }
+}
+
+fn install_task(provider: &dyn autostart::AutostartProvider) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving current exe path")?;
+    eprintln!("Installing autostart via {} for: {}", provider.facility_name(), exe.display());
+    eprintln!("Note: complete OAuth interactively first (just run the binary once) — the");
+    eprintln!("autostart entry can't open a browser if there's no cached token yet.");
+    provider.install(&exe)?;
+    eprintln!("Done. The supervisor will launch at your next logon.");
+    Ok(())
+}
+
+fn uninstall_task(provider: &dyn autostart::AutostartProvider) -> Result<()> {
+    eprintln!("Removing autostart from {}…", provider.facility_name());
+    provider.uninstall()?;
+    eprintln!("Done.");
+    Ok(())
+}
+
+fn task_status(provider: &dyn autostart::AutostartProvider) -> Result<()> {
+    match provider.status()? {
+        autostart::AutostartStatus::Installed { details } => {
+            eprintln!("Installed ({}). {}", provider.facility_name(), details);
+        }
+        autostart::AutostartStatus::NotInstalled => {
+            eprintln!("Not installed ({} — run `install-task` to register).", provider.facility_name());
+        }
+    }
+    Ok(())
+}
+
+async fn run_daemon(cli: Cli) -> Result<()> {
     let mut cfg = load_or_init_config()?;
     if let Some(forced) = cli.machine_id.clone() { cfg.machine_id = forced; }
     info!(machine_id = %cfg.machine_id, daemon = DAEMON_VERSION, "starting");
@@ -511,4 +584,27 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn main() -> Result<()> {
+    attach_parent_console_if_any();
+
+    let cli = Cli::parse();
+
+    // Subcommands: short-lived, console-driven. Skip the file-logging
+    // setup (which targets long-running daemon output) and just print
+    // to stderr — that's what the user is watching.
+    if let Some(cmd) = cli.command {
+        return run_subcommand(cmd);
+    }
+
+    // Daemon path — file-backed tracing, then the tokio runtime.
+    let log = logging::init().context("initializing logging")?;
+    info!(log_path = %log.log_path.display(), "logs will be written here");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    runtime.block_on(run_daemon(cli))
 }

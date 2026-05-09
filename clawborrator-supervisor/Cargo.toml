@@ -32,3 +32,8 @@ rand               = { workspace = true }
 portable-pty       = { workspace = true }
 vt100              = { workspace = true }
 chrono             = { workspace = true }
+tracing-appender   = { workspace = true }
+whoami             = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys        = { workspace = true }
