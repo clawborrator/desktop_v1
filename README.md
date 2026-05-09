@@ -1,46 +1,135 @@
 # desktop_v1
 
-Lean rewrite of the desktop daemon, built around the hub's `/supervisor`
-WebSocket as the single command channel. Step 1 is handshake-only; later
-steps add session create/kill/restart, vt100 terminal mirroring, and
-managed-vs-unmanaged session bookkeeping. See the chat history for the
-full design.
+`clawborrator-supervisor` — desktop daemon that connects a workstation
+to a clawborrator hub and lets the hub spawn / control Claude Code
+sessions on it. Pre-built Windows binary on
+[GitHub Releases](https://github.com/clawborrator/desktop_v1/releases).
+
+Sibling repos:
+
+- [`hub_v1`](https://github.com/clawborrator/hub_v1) — the hub, deployed at https://next.clawborrator.com
+- [`channel_v1`](https://github.com/clawborrator/channel_v1) — `clawborrator-mcp`, the per-Claude-Code MCP integration
+- [`cli_v1`](https://github.com/clawborrator/cli_v1) — `claw`, the operator CLI
 
 ## Status
 
-- [x] Step 1 — handshake-only client (this crate)
-- [x] Step 1.5 — OAuth login (browser-based SPA + PKCE)
-- [ ] Step 2 — push events (`session.state`, `desktop.health`)
-- [ ] Step 3 — folder allowlist + tray UX for adding folders
-- [ ] Step 4 — read-only commands (`session.list`, `daemon.version`)
-- [ ] Step 5 — state-changing commands (`session.create/kill/restart`) with audit log
-- [ ] Step 6 — vt100 + `session.screenshot` + live frame streaming
+| | |
+|---|---|
+| Hub WS handshake + reconnect | shipped |
+| OAuth login (SPA + PKCE) | shipped |
+| Session create / kill / restart / destroy | shipped |
+| Screenshot + input forwarding | shipped |
+| Windows: per-user Task Scheduler autostart | shipped (v0.1.0) |
+| Windows: system-tray icon + graceful Quit | shipped (v0.2.0) |
+| macOS / Linux autostart | stubbed — install fails with NotYetImplemented |
+| Push events (`desktop.health` etc) | open |
 
-## Run
+## Quick start (Windows)
+
+1. Download the latest
+   [`clawborrator-supervisor-windows-x64.exe`](https://github.com/clawborrator/desktop_v1/releases/latest)
+   from GitHub Releases.
+
+2. Open PowerShell, sign in:
+   ```pwsh
+   .\clawborrator-supervisor-windows-x64.exe login
+   ```
+   This opens a browser, authenticates against the hub via GitHub
+   OAuth + PKCE, and caches a `cw_app_…` Bearer token at
+   `%USERPROFILE%\.clawborrator\desktop_v1.json`.
+
+3. Register the daemon as a per-user Task Scheduler entry — no admin
+   elevation required:
+   ```pwsh
+   .\clawborrator-supervisor-windows-x64.exe install-task
+   ```
+
+4. Log out and back in. The daemon launches silently and a system-tray
+   icon appears (probably in the overflow chevron — drag it to pin).
+   Logs land at `%LOCALAPPDATA%\clawborrator\supervisor.log`.
+
+5. Open https://next.clawborrator.com/orchard/, click `+ Session`,
+   pick a folder, and the daemon spawns a managed Claude Code session
+   you and any collaborators you share with can drive in real time.
+
+## Subcommands
+
+| Command | Description |
+|---|---|
+| `login [--force]` | OAuth flow + cache a token. `--force` re-auths over an existing token. |
+| `logout` | Server-side revoke + clear local cache. `machine_id` preserved. |
+| `install-task` | Register the autostart entry (Windows only). Requires a cached token. |
+| `uninstall-task` | Remove the autostart entry (idempotent). |
+| `task-status` | Report whether the autostart entry is registered. |
+| (no subcommand) | Run the daemon. |
+
+`--hub-url` / `CLAWBORRATOR_HUB_URL` overrides the default
+`https://next.clawborrator.com`. `--pat` / `CLAWBORRATOR_PAT` overrides
+the cached token (useful for ad-hoc testing with a token from another
+machine).
+
+## Tray icon (Windows)
+
+When the daemon is running it shows a tray icon with a right-click
+menu:
+
+- **Open dashboard** — opens the configured hub URL in your default browser
+- **View log** — opens `supervisor.log` in your default app
+- **Quit** — graceful shutdown (the daemon path through Task Manager
+  is hard-kill; prefer Quit so the WS connection closes cleanly)
+
+The release Windows build links as the GUI subsystem, so Task Scheduler
+launches it without a console flash. Subcommands invoked from
+PowerShell still print to the parent shell via
+`AttachConsole(ATTACH_PARENT_PROCESS)`.
+
+## macOS / Linux
+
+The daemon path runs from source today — `cargo run -p
+clawborrator-supervisor` works on macOS / Linux. The autostart
+subcommands (`install-task` etc.) return `NotYetImplemented`; run the
+binary manually until the per-OS autostart impls land (launchd
+LaunchAgent on macOS; systemd-user / XDG autostart on Linux).
 
 ```sh
-# Optional — defaults to https://next.clawborrator.com
-export CLAWBORRATOR_HUB_URL=https://next.clawborrator.com
-
+cargo run -p clawborrator-supervisor -- login
 cargo run -p clawborrator-supervisor
 ```
 
-First run opens your browser to authenticate with GitHub, then writes
-the minted `cw_app_…` token to `~/.clawborrator/desktop_v1.json`
-alongside the daemon's stable `machine_id`. Subsequent runs reuse the
-cached token. The file is `0600` on Unix; on Windows the per-user
-profile dir is the only protection.
+## Architecture (Windows daemon path)
 
-To override the cached token (e.g., for ad-hoc testing with a token
-copied from another tool), set `CLAWBORRATOR_PAT`:
+Three threads, one tokio runtime, one shutdown signal:
+
+| Thread | Owns |
+|---|---|
+| Main | tray icon + Win32 `GetMessageW` message pump (thread-affine) |
+| Tokio worker | `run_daemon`: WS to `/supervisor`, reconnect loop, command dispatch |
+| Menu drainer | `MenuEvent::receiver()` loop, dispatches Open / View log / Quit |
+
+Tray Quit flips a `tokio::sync::watch` so the daemon unwinds the WS
+cleanly. Daemon-thread exit (success, error, panic) posts `WM_QUIT` to
+the main thread so the tray icon dies with the process — no zombie UI.
+
+## Configuration
+
+| Path | Contents |
+|---|---|
+| `%USERPROFILE%\.clawborrator\desktop_v1.json` (Windows) | `machine_id`, cached token, hub URL the token was minted against |
+| `~/.clawborrator/desktop_v1.json` (macOS / Linux) | same |
+| `%LOCALAPPDATA%\clawborrator\supervisor.log` (Windows) | daily-rolling daemon log |
+| `~/Library/Application Support/clawborrator/supervisor.log` (macOS) | same |
+| `~/.local/share/clawborrator/supervisor.log` (Linux) | same |
+
+## Build from source
 
 ```sh
-export CLAWBORRATOR_PAT=cw_app_…   # or cw_sess_…
-cargo run -p clawborrator-supervisor
+cargo build --release -p clawborrator-supervisor
 ```
 
-To wipe and re-register as a fresh machine (new `machine_id`, fresh
-OAuth flow), delete `~/.clawborrator/desktop_v1.json`.
+Outputs `target/release/clawborrator-supervisor.exe` (Windows) or
+`clawborrator-supervisor` elsewhere. Requires Rust 1.75+. Logo asset
+at `clawborrator-supervisor/assets/tray.png` is embedded via
+`include_bytes!` at compile time.
 
 ## Logging
 
@@ -50,14 +139,10 @@ OAuth flow), delete `~/.clawborrator/desktop_v1.json`.
 RUST_LOG=info,clawborrator_supervisor=debug cargo run -p clawborrator-supervisor
 ```
 
-## Why a separate workspace from `desktop/`
+The release binary logs to file (no stdout — windowless GUI build).
+Debug builds keep the console subsystem so `cargo run` shows logs
+inline.
 
-The existing `desktop/` workspace solves a different problem (local
-process supervision via Unix-socket IPC, with HTTPS polling for hub state).
-desktop_v1 inverts that: the hub *commands* the daemon over a long-lived
-WS, and the daemon's only job is to be a passive executor of those
-commands. Different protocol, different lifecycle, easier to keep them
-separate while the new shape settles.
+## License
 
-The two are not currently expected to merge — desktop_v1 will eventually
-subsume the user-facing pieces of `desktop/` once Steps 2-6 land.
+MIT OR Apache-2.0.
