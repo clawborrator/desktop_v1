@@ -1,0 +1,514 @@
+// clawborrator-supervisor — Step 1 (handshake-only) + OAuth login.
+//
+// Connects to the hub's /supervisor WebSocket, sends a `hello` frame
+// identifying this machine, then keeps the connection alive with
+// 30s pings. No command handling yet — that's Step 2+. Reconnects
+// with exponential backoff on disconnect so the daemon survives
+// transient network blips and hub restarts.
+//
+// Auth: first run walks the SPA OAuth + PKCE flow (browser-based)
+// to mint a `cw_app_…` Bearer token, then persists it to the local
+// config. Subsequent runs reuse the cached token until you nuke
+// `~/.clawborrator/desktop_v1.json`. CLAWBORRATOR_PAT env var
+// overrides the cache for ad-hoc testing.
+//
+// Identity: the daemon assigns itself a stable machine_id stored
+// in the same config file. Hostname alone isn't unique (people
+// rename machines, dual-boot, VMs); the install nonce makes it
+// durable across renames while staying stable across daemon
+// restarts.
+
+mod oauth;
+mod sessions;
+mod spawn;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use tokio::time::{sleep, Instant};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{error, info, warn};
+use url::Url;
+
+use crate::sessions::SessionManager;
+use crate::spawn::{create_session, destroy_session, input_session, kill_session, restart_session, screenshot_session, CreateArgs};
+
+const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_HUB_URL: &str = "https://next.clawborrator.com";
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "clawborrator desktop supervisor daemon")]
+struct Cli {
+    /// Hub base URL. Defaults to https://next.clawborrator.com or
+    /// the CLAWBORRATOR_HUB_URL env var.
+    #[arg(long, env = "CLAWBORRATOR_HUB_URL", default_value = DEFAULT_HUB_URL)]
+    hub_url: String,
+
+    /// Bearer token (`cw_pat_*` or `cw_app_*`). Read from
+    /// CLAWBORRATOR_PAT env var if not provided. OAuth-driven mint
+    /// flow is a follow-on.
+    #[arg(long, env = "CLAWBORRATOR_PAT")]
+    pat: Option<String>,
+
+    /// Override the machine_id (otherwise read/generated from the
+    /// config file at `~/.clawborrator/desktop_v1.json`).
+    #[arg(long, env = "CLAWBORRATOR_MACHINE_ID")]
+    machine_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Config {
+    /// Stable per-install identifier. Generated once on first run;
+    /// persists across daemon restarts. NOT keyed off hostname so
+    /// that a hostname change doesn't orphan the registration.
+    machine_id: String,
+    /// `cw_app_…` Bearer token minted via the OAuth flow on first
+    /// run. Optional only because the file is created BEFORE the
+    /// flow runs (so we have a stable machine_id during the
+    /// browser round-trip). Once the OAuth flow completes the
+    /// token is written back via `save_config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    /// Hub URL the token was minted against. Lets us refuse to
+    /// reuse a token when the operator changes hub URLs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub_url: Option<String>,
+}
+
+fn config_path() -> Result<PathBuf> {
+    let dir = dirs::home_dir()
+        .ok_or_else(|| anyhow!("could not resolve home dir"))?
+        .join(".clawborrator");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {dir:?}"))?;
+    Ok(dir.join("desktop_v1.json"))
+}
+
+/// Load or generate the per-install config. First run mints a fresh
+/// uuid for `machine_id` and writes the file with no token (the
+/// OAuth flow fills that in later). Subsequent runs reuse both.
+fn load_or_init_config() -> Result<Config> {
+    let path = config_path()?;
+    if path.exists() {
+        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path:?}"))?;
+        let cfg: Config = serde_json::from_str(&text).with_context(|| "parsing config")?;
+        return Ok(cfg);
+    }
+    let cfg = Config {
+        machine_id: uuid::Uuid::new_v4().to_string(),
+        token:      None,
+        hub_url:    None,
+    };
+    save_config(&cfg)?;
+    info!(path = %path.display(), "wrote fresh config with new machine_id");
+    Ok(cfg)
+}
+
+fn save_config(cfg: &Config) -> Result<()> {
+    let path = config_path()?;
+    let json = serde_json::to_string_pretty(cfg)?;
+    std::fs::write(&path, json).with_context(|| format!("writing {path:?}"))?;
+    // Best-effort tighten perms on Unix; no-op on Windows.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Translate `https://host/...` → `wss://host/supervisor`. The hub
+/// is HTTPS in production; localhost dev uses ws://. Either way we
+/// just swap the scheme rather than asking the operator to type
+/// two URLs.
+fn ws_url_for_supervisor(hub_url: &str) -> Result<Url> {
+    let mut u = Url::parse(hub_url).with_context(|| format!("invalid hub url: {hub_url}"))?;
+    let scheme = match u.scheme() {
+        "https" => "wss",
+        "http"  => "ws",
+        other => return Err(anyhow!("unsupported hub scheme: {other}")),
+    };
+    u.set_scheme(scheme).map_err(|_| anyhow!("set_scheme failed"))?;
+    u.set_path("/supervisor");
+    Ok(u)
+}
+
+#[derive(Serialize, Debug)]
+#[serde(tag = "t", rename_all = "snake_case")]
+enum OutFrame<'a> {
+    /// First frame after WS handshake. Hub uses it to register +
+    /// validate the daemon. `current_sessions` lets the hub
+    /// reconcile its managed_by_machine_id state — on a fresh
+    /// daemon start this is empty, so the hub clears managed_by
+    /// for all of this machine's previously-managed sessions
+    /// (their CCs are dead since the daemon was their parent).
+    /// `version` lets the hub gracefully downgrade for older
+    /// daemons.
+    Hello {
+        machine_id:       &'a str,
+        daemon_version:   &'a str,
+        hostname:         &'a str,
+        capabilities:     &'a [&'a str],
+        current_sessions: &'a [String],
+    },
+    Ping,
+    Pong,
+    /// RPC success — replies to a hub `cmd` frame by id.
+    Ok {
+        id:   &'a str,
+        data: serde_json::Value,
+    },
+    /// RPC failure — replies to a hub `cmd` frame by id.
+    Err {
+        id:      &'a str,
+        code:    &'a str,
+        message: &'a str,
+    },
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "t", rename_all = "snake_case")]
+enum InFrame {
+    /// Hub acknowledges the registration. Carries server-assigned
+    /// fields the daemon may want to log (e.g. the user this PAT
+    /// resolved to). Optional fields are flexible while the
+    /// protocol is in flux.
+    HelloAck {
+        #[serde(default)] user_login: Option<String>,
+        #[serde(default)] message:    Option<String>,
+    },
+    /// Hub-initiated ping; daemon responds with Pong.
+    Ping,
+    /// Reply to a daemon-initiated Ping.
+    Pong,
+    /// Hub-initiated RPC. Daemon executes `op` against `args` and
+    /// responds with an `ok` (carrying `data`) or `err` frame
+    /// keyed by the same `id`.
+    Cmd {
+        id:   String,
+        op:   String,
+        #[serde(default)] args: serde_json::Value,
+    },
+    /// Catch-all so unknown frames don't kill the connection.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Per-connection context threaded through every command handler.
+/// Owns the session-manager Arc + the auth bits the daemon needs
+/// to mint channel tokens / stamp managedBy on session.create.
+struct DaemonCtx {
+    pub hub_url:    String,
+    pub pat:        String,
+    pub machine_id: String,
+    pub mgr:        Arc<SessionManager>,
+}
+
+async fn run_session(ctx: &DaemonCtx, ws_url: &Url, cfg: &Config) -> Result<()> {
+    let host = hostname::get()
+        .ok()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    info!(url = %ws_url, "connecting to /supervisor");
+
+    let mut request: Request = ws_url.as_str().into_client_request()?;
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", ctx.pat).parse().context("invalid PAT for header")?,
+    );
+
+    let (mut ws, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .with_context(|| "ws handshake failed")?;
+    info!(status = %response.status(), "ws connected");
+
+    // Send the hello frame immediately; hub registers us against
+    // (userId-from-token, machine_id) and responds with HelloAck.
+    let current_sessions = ctx.mgr.list_session_ids();
+    let hello = OutFrame::Hello {
+        machine_id:       &cfg.machine_id,
+        daemon_version:   DAEMON_VERSION,
+        hostname:         &host,
+        capabilities:     &["session.create", "session.kill", "session.destroy", "session.restart", "session.screenshot", "session.input"],
+        current_sessions: &current_sessions,
+    };
+    ws.send(Message::Text(serde_json::to_string(&hello)?)).await?;
+
+    let mut next_ping = Instant::now() + PING_INTERVAL;
+
+    loop {
+        let now = Instant::now();
+        let until_ping = if next_ping > now { next_ping - now } else { Duration::ZERO };
+        tokio::select! {
+            biased;
+            _ = sleep(until_ping) => {
+                ws.send(Message::Text(serde_json::to_string(&OutFrame::Ping)?)).await?;
+                next_ping = Instant::now() + PING_INTERVAL;
+            }
+            msg = ws.next() => {
+                let Some(msg) = msg else { return Err(anyhow!("ws stream ended")); };
+                match msg? {
+                    Message::Text(text)   => handle_text(ctx, &mut ws, &text).await?,
+                    Message::Binary(_)    => warn!("ignoring unexpected binary frame"),
+                    Message::Ping(p)      => ws.send(Message::Pong(p)).await?,
+                    Message::Pong(_)      => (),
+                    Message::Close(frame) => {
+                        info!(?frame, "hub closed the connection");
+                        return Ok(());
+                    }
+                    Message::Frame(_)     => (),
+                }
+            }
+        }
+    }
+}
+
+async fn handle_text<S>(ctx: &DaemonCtx, ws: &mut tokio_tungstenite::WebSocketStream<S>, text: &str) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let parsed: InFrame = match serde_json::from_str(text) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(?e, raw = text, "failed to parse frame");
+            return Ok(());
+        }
+    };
+    match parsed {
+        InFrame::HelloAck { user_login, message } => {
+            info!(?user_login, ?message, "registered with hub");
+        }
+        InFrame::Ping => {
+            ws.send(Message::Text(serde_json::to_string(&OutFrame::Pong)?)).await?;
+        }
+        InFrame::Pong => { /* application-level pong; nothing to do */ }
+        InFrame::Cmd { id, op, args } => {
+            handle_cmd(ctx, ws, &id, &op, args).await?;
+        }
+        InFrame::Unknown => {
+            warn!(raw = text, "received unknown frame");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct SessionCreateArgs {
+    folder:        String,
+    #[serde(default, rename = "routingName")]
+    routing_name:  Option<String>,
+    #[serde(default, rename = "extraFlags")]
+    extra_flags:   Vec<String>,
+    /// Hub forwards the operator's AUTO START / MANUAL START
+    /// choice as a boolean. Default true (auto) — matches the
+    /// SPA modal's default and lets older callers continue
+    /// working without specifying.
+    #[serde(default = "default_true", rename = "autoEnter")]
+    auto_enter:    bool,
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Deserialize)]
+struct SessionRefArgs {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
+/// Dispatch helpers detect "no managed session" errors (the
+/// SessionManager's miss path) and map them to a specific
+/// `session_not_found` code. Hub-side orphan-restart relies on
+/// this code to decide whether to fall back to recreate.
+fn classify_dispatch_err(default_code: &str, e: anyhow::Error) -> (String, String) {
+    let msg = e.to_string();
+    if msg.contains("no managed session") {
+        ("session_not_found".into(), msg)
+    } else {
+        (default_code.into(), msg)
+    }
+}
+
+async fn dispatch_session_create(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
+    let parsed: SessionCreateArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
+    let folder = PathBuf::from(parsed.folder);
+    let routing_name_owned = parsed.routing_name;
+    let extra_flags = parsed.extra_flags;
+    let auto_enter = parsed.auto_enter;
+    let create_args = CreateArgs {
+        hub_url:      &ctx.hub_url,
+        pat:          &ctx.pat,
+        machine_id:   &ctx.machine_id,
+        folder,
+        routing_name: routing_name_owned.as_deref(),
+        extra_flags:  &extra_flags,
+        auto_enter,
+    };
+    match create_session(&ctx.mgr, create_args).await {
+        Ok(session_id) => Ok(serde_json::json!({ "sessionId": session_id })),
+        Err(e)         => Err(("create_failed".into(), e.to_string())),
+    }
+}
+
+fn dispatch_session_kill(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
+    let parsed: SessionRefArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
+    match kill_session(&ctx.mgr, &parsed.session_id) {
+        Ok(())  => Ok(serde_json::json!({ "ok": true })),
+        Err(e)  => Err(classify_dispatch_err("kill_failed", e)),
+    }
+}
+
+async fn dispatch_session_destroy(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
+    let parsed: SessionRefArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
+    match destroy_session(&ctx.mgr, &ctx.hub_url, &ctx.pat, &parsed.session_id).await {
+        Ok(())  => Ok(serde_json::json!({ "ok": true })),
+        Err(e)  => Err(classify_dispatch_err("destroy_failed", e)),
+    }
+}
+
+async fn dispatch_session_restart(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
+    let parsed: SessionRefArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
+    match restart_session(&ctx.mgr, &ctx.hub_url, &ctx.pat, &ctx.machine_id, &parsed.session_id).await {
+        Ok(new_id) => Ok(serde_json::json!({ "sessionId": new_id })),
+        Err(e)     => Err(classify_dispatch_err("restart_failed", e)),
+    }
+}
+
+fn dispatch_session_screenshot(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
+    let parsed: SessionRefArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
+    match screenshot_session(&ctx.mgr, &parsed.session_id) {
+        Ok(v)  => Ok(v),
+        Err(e) => Err(classify_dispatch_err("screenshot_failed", e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionInputArgs {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    bytes:      String,
+}
+
+fn dispatch_session_input(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
+    let parsed: SessionInputArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
+    match input_session(&ctx.mgr, &parsed.session_id, parsed.bytes.as_bytes()) {
+        Ok(())  => Ok(serde_json::json!({ "ok": true, "wrote": parsed.bytes.len() })),
+        Err(e)  => Err(classify_dispatch_err("input_failed", e)),
+    }
+}
+
+// Dispatch a hub-initiated RPC. Each verb returns either Ok(data) →
+// daemon emits `ok` frame, or Err((code, message)) → daemon emits
+// `err`. session.restart is intentionally still unimplemented —
+// requires retaining the create-args for the original session, which
+// is its own slice. session.create / kill / screenshot are real.
+async fn handle_cmd<S>(
+    ctx: &DaemonCtx,
+    ws:  &mut tokio_tungstenite::WebSocketStream<S>,
+    id:  &str,
+    op:  &str,
+    args: serde_json::Value,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let result: std::result::Result<serde_json::Value, (String, String)> = match op {
+        "session.create"     => dispatch_session_create(ctx, args).await,
+        "session.kill"       => dispatch_session_kill(ctx, args),
+        "session.destroy"    => dispatch_session_destroy(ctx, args).await,
+        "session.restart"    => dispatch_session_restart(ctx, args).await,
+        "session.screenshot" => dispatch_session_screenshot(ctx, args),
+        "session.input"      => dispatch_session_input(ctx, args),
+        other                => Err(("unknown_op".into(), format!("unknown op: {other}"))),
+    };
+    match result {
+        Ok(data) => ws.send(Message::Text(serde_json::to_string(&OutFrame::Ok { id, data })?)).await?,
+        Err((code, msg)) => ws.send(Message::Text(serde_json::to_string(&OutFrame::Err {
+            id, code: &code, message: &msg,
+        })?)).await?,
+    }
+    Ok(())
+}
+
+async fn run_with_reconnect(ctx: DaemonCtx, ws_url: Url, cfg: Config) -> Result<()> {
+    let mut backoff = RECONNECT_BACKOFF_INITIAL;
+    loop {
+        match run_session(&ctx, &ws_url, &cfg).await {
+            Ok(()) => {
+                info!("session ended cleanly; reconnecting in {:?}", RECONNECT_BACKOFF_INITIAL);
+                backoff = RECONNECT_BACKOFF_INITIAL;
+            }
+            Err(e) => {
+                error!(?e, "session error; reconnecting in {:?}", backoff);
+            }
+        }
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+/// Resolve the Bearer token to use. Priority:
+///   1. `--pat` flag / CLAWBORRATOR_PAT env (always wins; ad-hoc)
+///   2. cached token in `~/.clawborrator/desktop_v1.json` (also
+///      verified to match `--hub-url` so a hub change forces a
+///      fresh OAuth round-trip)
+///   3. interactive OAuth flow (browser-based PKCE)
+async fn resolve_token(cli: &Cli, cfg: &mut Config) -> Result<String> {
+    if let Some(t) = &cli.pat {
+        return Ok(t.clone());
+    }
+    if let Some(cached) = &cfg.token {
+        if cfg.hub_url.as_deref() == Some(cli.hub_url.as_str()) {
+            return Ok(cached.clone());
+        }
+        warn!("cached token was minted against a different hub_url; re-running OAuth");
+    }
+    let token = oauth::run_oauth_flow(&cli.hub_url).await
+        .with_context(|| "OAuth login failed")?;
+    cfg.token   = Some(token.clone());
+    cfg.hub_url = Some(cli.hub_url.clone());
+    save_config(cfg)?;
+    info!("OAuth login complete; token cached");
+    Ok(token)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .init();
+
+    let cli = Cli::parse();
+
+    let mut cfg = load_or_init_config()?;
+    if let Some(forced) = cli.machine_id.clone() { cfg.machine_id = forced; }
+    info!(machine_id = %cfg.machine_id, daemon = DAEMON_VERSION, "starting");
+
+    let token = resolve_token(&cli, &mut cfg).await?;
+    let ws_url = ws_url_for_supervisor(&cli.hub_url)?;
+
+    let ctx = DaemonCtx {
+        hub_url:    cli.hub_url.clone(),
+        pat:        token,
+        machine_id: cfg.machine_id.clone(),
+        mgr:        Arc::new(SessionManager::new()),
+    };
+
+    tokio::select! {
+        res = run_with_reconnect(ctx, ws_url, cfg) => res,
+        _ = tokio::signal::ctrl_c() => {
+            info!("ctrl-c received; shutting down");
+            Ok(())
+        }
+    }
+}
