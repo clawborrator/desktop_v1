@@ -30,6 +30,7 @@ mod logging;
 mod oauth;
 mod sessions;
 mod spawn;
+#[cfg(target_os = "windows")] mod tray;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,7 +58,7 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "clawborrator desktop supervisor daemon")]
-struct Cli {
+pub(crate) struct Cli {
     /// Hub base URL. Defaults to https://next.clawborrator.com or
     /// the CLAWBORRATOR_HUB_URL env var.
     #[arg(long, env = "CLAWBORRATOR_HUB_URL", default_value = DEFAULT_HUB_URL)]
@@ -674,7 +675,7 @@ fn task_status(provider: &dyn autostart::AutostartProvider) -> Result<()> {
     Ok(())
 }
 
-async fn run_daemon(cli: Cli) -> Result<()> {
+pub(crate) async fn run_daemon(cli: Cli) -> Result<()> {
     let mut cfg = load_or_init_config()?;
     if let Some(forced) = cli.machine_id.clone() { cfg.machine_id = forced; }
     info!(machine_id = %cfg.machine_id, daemon = DAEMON_VERSION, "starting");
@@ -701,25 +702,39 @@ async fn run_daemon(cli: Cli) -> Result<()> {
 fn main() -> Result<()> {
     attach_parent_console_if_any();
 
-    let cli = Cli::parse();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("building tokio runtime")?;
+    let mut cli = Cli::parse();
 
-    runtime.block_on(async_main(cli))
-}
-
-async fn async_main(mut cli: Cli) -> Result<()> {
-    // Subcommands are short-lived and console-driven. Skip the file-
-    // logging setup (which targets long-running daemon output); the
-    // subcommand handlers print directly via eprintln so the user
-    // sees feedback in the parent shell.
+    // Subcommand path — short-lived, console-driven. tokio on the
+    // main thread is fine because there's no tray to run there.
     if let Some(cmd) = cli.command.take() {
-        return run_subcommand(&cli, cmd).await;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime")?;
+        return runtime.block_on(run_subcommand(&cli, cmd));
     }
 
+    // Daemon path — long-running, file-based logging always on.
     let log = logging::init().context("initializing logging")?;
     info!(log_path = %log.log_path.display(), "logs will be written here");
-    run_daemon(cli).await
+
+    // Windows: tray owns the main thread (Win32 message loop is
+    // thread-affine). The daemon future runs on a tokio worker
+    // started inside `tray::run_with_tray`.
+    #[cfg(target_os = "windows")]
+    {
+        tray::run_with_tray(cli, log.log_path.clone())
+    }
+
+    // Non-Windows: no tray yet — tokio on main, run the daemon
+    // directly. macOS/Linux tray support lands when their autostart
+    // facilities do (PR4+).
+    #[cfg(not(target_os = "windows"))]
+    {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime")?;
+        runtime.block_on(run_daemon(cli))
+    }
 }
