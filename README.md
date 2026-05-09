@@ -5,12 +5,6 @@ to a clawborrator hub and lets the hub spawn / control Claude Code
 sessions on it. Pre-built Windows binary on
 [GitHub Releases](https://github.com/clawborrator/desktop_v1/releases).
 
-Sibling repos:
-
-- [`hub_v1`](https://github.com/clawborrator/hub_v1) — the hub, deployed at https://next.clawborrator.com
-- [`channel_v1`](https://github.com/clawborrator/channel_v1) — `clawborrator-mcp`, the per-Claude-Code MCP integration
-- [`cli_v1`](https://github.com/clawborrator/cli_v1) — `claw`, the operator CLI
-
 ## Status
 
 | | |
