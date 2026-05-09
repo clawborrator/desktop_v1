@@ -83,9 +83,23 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run the OAuth flow against `--hub-url`, mint an app token, and
+    /// cache it locally. Required before the daemon can start. If a
+    /// token is already cached for the same hub, this is a no-op
+    /// unless `--force` is passed.
+    Login {
+        /// Re-authenticate even if a valid token is already cached.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Revoke the cached app token server-side (best-effort) and
+    /// clear it from the local config. The machine_id is preserved
+    /// so a subsequent `login` re-uses this machine's identity.
+    Logout,
     /// Register an autostart entry that launches this binary at
     /// user logon. On Windows that's a per-user Task Scheduler
-    /// entry — no admin elevation needed.
+    /// entry — no admin elevation needed. Requires a cached token
+    /// (run `login` first).
     InstallTask,
     /// Remove the autostart entry. Idempotent.
     UninstallTask,
@@ -485,27 +499,27 @@ async fn run_with_reconnect(ctx: DaemonCtx, ws_url: Url, cfg: Config) -> Result<
 
 /// Resolve the Bearer token to use. Priority:
 ///   1. `--pat` flag / CLAWBORRATOR_PAT env (always wins; ad-hoc)
-///   2. cached token in `~/.clawborrator/desktop_v1.json` (also
-///      verified to match `--hub-url` so a hub change forces a
-///      fresh OAuth round-trip)
-///   3. interactive OAuth flow (browser-based PKCE)
-async fn resolve_token(cli: &Cli, cfg: &mut Config) -> Result<String> {
+///   2. cached token in `~/.clawborrator/desktop_v1.json` (verified
+///      to match `--hub-url`)
+///
+/// No implicit OAuth fallback — the daemon can be launched from a
+/// non-interactive context (Task Scheduler at logon, with no console
+/// or browser available), where opening a browser would silently fail.
+/// Use the `login` subcommand to mint a token interactively.
+fn resolve_token(cli: &Cli, cfg: &Config) -> Result<String> {
     if let Some(t) = &cli.pat {
         return Ok(t.clone());
     }
-    if let Some(cached) = &cfg.token {
-        if cfg.hub_url.as_deref() == Some(cli.hub_url.as_str()) {
-            return Ok(cached.clone());
-        }
-        warn!("cached token was minted against a different hub_url; re-running OAuth");
+    let cached = cfg.token.as_deref().ok_or_else(|| anyhow!(
+        "no cached app token — run `clawborrator-supervisor login` first to authenticate"
+    ))?;
+    if cfg.hub_url.as_deref() != Some(cli.hub_url.as_str()) {
+        return Err(anyhow!(
+            "cached token was minted against {:?}, not {} — run `clawborrator-supervisor login` against the new hub",
+            cfg.hub_url, cli.hub_url,
+        ));
     }
-    let token = oauth::run_oauth_flow(&cli.hub_url).await
-        .with_context(|| "OAuth login failed")?;
-    cfg.token   = Some(token.clone());
-    cfg.hub_url = Some(cli.hub_url.clone());
-    save_config(cfg)?;
-    info!("OAuth login complete; token cached");
-    Ok(token)
+    Ok(cached.to_string())
 }
 
 /// Re-attach to the parent shell's console on Windows release builds
@@ -524,20 +538,118 @@ fn attach_parent_console_if_any() {
 #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
 fn attach_parent_console_if_any() {}
 
-fn run_subcommand(cmd: Command) -> Result<()> {
+async fn run_subcommand(cli: &Cli, cmd: Command) -> Result<()> {
     let provider = autostart::current();
     match cmd {
-        Command::InstallTask   => install_task(provider),
-        Command::UninstallTask => uninstall_task(provider),
-        Command::TaskStatus    => task_status(provider),
+        Command::Login { force } => cmd_login(cli, force).await,
+        Command::Logout          => cmd_logout(cli).await,
+        Command::InstallTask     => install_task(provider),
+        Command::UninstallTask   => uninstall_task(provider),
+        Command::TaskStatus      => task_status(provider),
     }
 }
 
+async fn cmd_login(cli: &Cli, force: bool) -> Result<()> {
+    let mut cfg = load_or_init_config()?;
+
+    if !force && token_matches_hub(&cfg, &cli.hub_url) {
+        match fetch_user_login(&cli.hub_url, cfg.token.as_deref().unwrap()).await {
+            Ok(login) => {
+                eprintln!("Already logged in as {} at {}.", login, cli.hub_url);
+                eprintln!("Pass --force to re-authenticate.");
+                return Ok(());
+            }
+            Err(e) => eprintln!("Cached token rejected by hub ({e}); re-authenticating."),
+        }
+    }
+
+    let token = oauth::run_oauth_flow(&cli.hub_url).await
+        .with_context(|| "OAuth login failed")?;
+    cfg.token   = Some(token.clone());
+    cfg.hub_url = Some(cli.hub_url.clone());
+    save_config(&cfg)?;
+
+    match fetch_user_login(&cli.hub_url, &token).await {
+        Ok(login) => eprintln!("Logged in as {} at {}.", login, cli.hub_url),
+        Err(e)    => eprintln!("Logged in (couldn't confirm identity via /api/v1/me: {e})"),
+    }
+    eprintln!("Run `install-task` next if you want the daemon to launch at logon.");
+    Ok(())
+}
+
+async fn cmd_logout(cli: &Cli) -> Result<()> {
+    let mut cfg = load_or_init_config()?;
+
+    if let Some(token) = cfg.token.clone() {
+        match revoke_token(&cli.hub_url, &token).await {
+            Ok(()) => eprintln!("Hub revoked the token."),
+            Err(e) => warn!(?e, "hub /auth/logout failed; clearing local cache anyway"),
+        }
+    } else {
+        eprintln!("No cached token; nothing to revoke server-side.");
+    }
+
+    cfg.token   = None;
+    cfg.hub_url = None;
+    save_config(&cfg)?;
+    eprintln!("Local config cleared. machine_id preserved.");
+
+    let provider = autostart::current();
+    if let Ok(autostart::AutostartStatus::Installed { .. }) = provider.status() {
+        eprintln!("Note: autostart is still installed — without a token the daemon will fail at next logon.");
+        eprintln!("Run `uninstall-task` to remove it, or `login` to mint a fresh token.");
+    }
+    Ok(())
+}
+
+fn token_matches_hub(cfg: &Config, hub_url: &str) -> bool {
+    cfg.token.is_some() && cfg.hub_url.as_deref() == Some(hub_url)
+}
+
+/// GET /api/v1/me — returns `githubLogin`. Used after login to confirm
+/// the token works AND to surface the resolved user to the operator.
+async fn fetch_user_login(hub_url: &str, token: &str) -> Result<String> {
+    let url = Url::parse(hub_url)?.join("/api/v1/me")?;
+    let resp = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("GET /api/v1/me")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("hub returned {}", resp.status());
+    }
+    let body: serde_json::Value = resp.json().await.context("parsing /api/v1/me response")?;
+    body.get("githubLogin")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("missing githubLogin in /me response"))
+}
+
+/// POST /api/v1/auth/logout — revokes the bearer token server-side.
+/// Idempotent on the hub; this just translates HTTP errors to anyhow.
+async fn revoke_token(hub_url: &str, token: &str) -> Result<()> {
+    let url = Url::parse(hub_url)?.join("/api/v1/auth/logout")?;
+    let resp = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("POST /api/v1/auth/logout")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("hub returned {}", resp.status());
+    }
+    Ok(())
+}
+
 fn install_task(provider: &dyn autostart::AutostartProvider) -> Result<()> {
+    let cfg = load_or_init_config()?;
+    if cfg.token.is_none() {
+        anyhow::bail!("no cached token — run `clawborrator-supervisor login` first; otherwise the autostart entry will fire with no credentials");
+    }
     let exe = std::env::current_exe().context("resolving current exe path")?;
     eprintln!("Installing autostart via {} for: {}", provider.facility_name(), exe.display());
-    eprintln!("Note: complete OAuth interactively first (just run the binary once) — the");
-    eprintln!("autostart entry can't open a browser if there's no cached token yet.");
+    eprintln!("Token cached for hub: {}", cfg.hub_url.as_deref().unwrap_or("<none>"));
     provider.install(&exe)?;
     eprintln!("Done. The supervisor will launch at your next logon.");
     Ok(())
@@ -567,7 +679,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
     if let Some(forced) = cli.machine_id.clone() { cfg.machine_id = forced; }
     info!(machine_id = %cfg.machine_id, daemon = DAEMON_VERSION, "starting");
 
-    let token = resolve_token(&cli, &mut cfg).await?;
+    let token = resolve_token(&cli, &cfg)?;
     let ws_url = ws_url_for_supervisor(&cli.hub_url)?;
 
     let ctx = DaemonCtx {
@@ -590,21 +702,24 @@ fn main() -> Result<()> {
     attach_parent_console_if_any();
 
     let cli = Cli::parse();
-
-    // Subcommands: short-lived, console-driven. Skip the file-logging
-    // setup (which targets long-running daemon output) and just print
-    // to stderr — that's what the user is watching.
-    if let Some(cmd) = cli.command {
-        return run_subcommand(cmd);
-    }
-
-    // Daemon path — file-backed tracing, then the tokio runtime.
-    let log = logging::init().context("initializing logging")?;
-    info!(log_path = %log.log_path.display(), "logs will be written here");
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(run_daemon(cli))
+
+    runtime.block_on(async_main(cli))
+}
+
+async fn async_main(mut cli: Cli) -> Result<()> {
+    // Subcommands are short-lived and console-driven. Skip the file-
+    // logging setup (which targets long-running daemon output); the
+    // subcommand handlers print directly via eprintln so the user
+    // sees feedback in the parent shell.
+    if let Some(cmd) = cli.command.take() {
+        return run_subcommand(&cli, cmd).await;
+    }
+
+    let log = logging::init().context("initializing logging")?;
+    info!(log_path = %log.log_path.display(), "logs will be written here");
+    run_daemon(cli).await
 }
