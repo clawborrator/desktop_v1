@@ -127,7 +127,12 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
 }
 
 /// Run the OAuth flow. Returns the minted `cw_app_…` token.
-pub async fn run_oauth_flow(hub_url: &str) -> Result<String> {
+///
+/// `machine_id` is forwarded as a query param on /spa/start so the
+/// hub can stamp it on the resulting token row. Re-auth from the
+/// same machine_id revokes the prior token (no orphan accumulation),
+/// and `claw desktop delete` uses it for FK-style cleanup.
+pub async fn run_oauth_flow(hub_url: &str, machine_id: &str) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await
         .context("binding loopback for OAuth callback")?;
     let port = listener.local_addr()?.port();
@@ -142,7 +147,8 @@ pub async fn run_oauth_flow(hub_url: &str) -> Result<String> {
         .append_pair("state",                 &state)
         .append_pair("code_challenge",        &challenge)
         .append_pair("code_challenge_method", "S256")
-        .append_pair("app_name",              APP_NAME);
+        .append_pair("app_name",              APP_NAME)
+        .append_pair("machine_id",            machine_id);
 
     info!(url = %authorize, "opening browser for GitHub OAuth");
     eprintln!("\nOpening your browser to authenticate with GitHub.");

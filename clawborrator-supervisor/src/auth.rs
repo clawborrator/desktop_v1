@@ -45,7 +45,7 @@ pub async fn login(cfg: &mut Config, hub_url: &str, force: bool) -> Result<Login
         }
         // Cached token rejected by the hub — fall through to re-auth.
     }
-    let token = oauth::run_oauth_flow(hub_url).await
+    let token = oauth::run_oauth_flow(hub_url, &cfg.machine_id).await
         .with_context(|| "OAuth login failed")?;
     cfg.token   = Some(token.clone());
     cfg.hub_url = Some(hub_url.to_string());
