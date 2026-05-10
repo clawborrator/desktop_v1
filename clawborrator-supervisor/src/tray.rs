@@ -163,6 +163,23 @@ fn decode_icon() -> Result<Icon> {
         .map_err(|e| anyhow!("Icon::from_rgba: {e}"))
 }
 
+/// Three-way classification of a `MenuEvent` against our known IDs.
+/// `Unknown` covers any future menu item whose handler hasn't been
+/// wired (or, in practice, debounce events the crate sometimes emits).
+enum MenuAction {
+    OpenDashboard,
+    OpenLog,
+    Quit,
+    Unknown,
+}
+
+fn classify(ev: &tray_icon::menu::MenuEvent, ids: &MenuIds) -> MenuAction {
+    if      ev.id == ids.dashboard { MenuAction::OpenDashboard }
+    else if ev.id == ids.log       { MenuAction::OpenLog }
+    else if ev.id == ids.quit      { MenuAction::Quit }
+    else                           { MenuAction::Unknown }
+}
+
 fn drain_menu_events(
     ids:         MenuIds,
     hub_url:     String,
@@ -170,17 +187,20 @@ fn drain_menu_events(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) {
     for ev in MenuEvent::receiver() {
-        if ev.id == ids.dashboard {
-            if let Err(e) = webbrowser::open(&hub_url) {
-                warn!(?e, hub_url = %hub_url, "failed to open dashboard");
+        match classify(&ev, &ids) {
+            MenuAction::OpenDashboard => {
+                if let Err(e) = webbrowser::open(&hub_url) {
+                    warn!(?e, hub_url = %hub_url, "failed to open dashboard");
+                }
             }
-        } else if ev.id == ids.log {
-            open_path(&log_path);
-        } else if ev.id == ids.quit {
-            info!("tray Quit clicked");
-            let _ = shutdown_tx.send(true);
-            unsafe { PostQuitMessage(0); }
-            return;
+            MenuAction::OpenLog => open_path(&log_path),
+            MenuAction::Quit => {
+                info!("tray Quit clicked");
+                let _ = shutdown_tx.send(true);
+                unsafe { PostQuitMessage(0); }
+                return;
+            }
+            MenuAction::Unknown => {}
         }
     }
 }

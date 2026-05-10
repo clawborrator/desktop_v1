@@ -22,7 +22,7 @@
 // the spawn-config dir so we don't accumulate orphans.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use tokio::time::{sleep, Instant};
 use tracing::{info, warn};
 use vt100::Parser;
 
-use crate::sessions::{fresh_pty_size, ManagedSession, SessionManager, PTY_COLS, PTY_ROWS};
+use crate::sessions::{fresh_pty_size, ManagedSession, SessionManager, SharedWriter, PTY_COLS, PTY_ROWS};
 
 const SIDECAR_POLL_TIMEOUT_MS: u64 = 30_000;
 const AUTO_ENTER_DURATION_MS:  u64 = 5_000;
@@ -251,7 +251,7 @@ fn spawn_pty_reader(mut reader: Box<dyn std::io::Read + Send>, parser: Arc<Mutex
 /// would close CC's stdin when the task ends, which exits CC.
 /// See ManagedSession for the lifecycle commentary.
 #[allow(dead_code)]
-fn spawn_auto_enter(writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>) {
+fn spawn_auto_enter(writer: SharedWriter) {
     tokio::spawn(async move {
         let deadline = Instant::now() + Duration::from_millis(AUTO_ENTER_DURATION_MS);
         while Instant::now() < deadline {
@@ -306,129 +306,152 @@ pub struct CreateArgs<'a> {
     pub auto_enter:   bool,
 }
 
-pub async fn create_session(mgr: &SessionManager, args: CreateArgs<'_>) -> Result<String> {
+// Stage helpers for create_session — split out so each stage is its
+// own ~5-CC function and the orchestrator stays at ~6. Order: precheck
+// → clean stale → preflight → persisted-session → mcp.json → spawn CC
+// → wire PTY → register. The preflight call itself stays inline in
+// create_session because the response feeds three subsequent stages.
+
+/// Refuse the create if the folder is bogus or another managed
+/// session is already running there. Two CC instances in the same
+/// folder race on `.claude/clawborrator/session.json` and produce
+/// undefined behavior — at best the second create's RPC times out;
+/// at worst it binds to the first session.
+fn precheck_create(mgr: &SessionManager, args: &CreateArgs<'_>) -> Result<()> {
     if !args.folder.is_dir() {
         bail!("folder does not exist or is not a directory: {}", args.folder.display());
     }
-    // Refuse a concurrent create in a folder that already has an
-    // active managed session. Two CC instances in the same folder
-    // would race on .claude/clawborrator.session.json (the sidecar
-    // file the daemon polls for the resolved hub session id) and
-    // produce undefined behavior — at best the second create's
-    // RPC times out; at worst it binds to the first session.
     if let Some(existing) = mgr.find_by_folder(&args.folder) {
         bail!(
             "folder {} already has an active managed session ({}). Kill or destroy it first, or pick a different folder.",
             args.folder.display(), existing,
         );
     }
-    // Clear any stale persisted-session file BEFORE spawning. The
-    // MCP (clawborrator-mcp) reads <cwd>/.claude/clawborrator/
-    // session.json on boot to rebind the same hub session id
-    // across `claude --resume`. We're about to overwrite it with
-    // the preflight id, but if a stale one exists from a prior
-    // session in this folder its sessionId would otherwise survive
-    // the file-rewrite branch in the MCP — defensive nuke.
-    //
-    // (We also nuke the legacy <cwd>/.claude/clawborrator.session.
-    // json path I wrote to in earlier daemon builds, on the off
-    // chance an operator's project still has one lying around.)
-    let persisted_path = args.folder.join(".claude").join("clawborrator").join("session.json");
+    Ok(())
+}
+
+/// Best-effort wipe of stale persisted-session files left behind by a
+/// previous session in the same folder. The MCP reads
+/// `<cwd>/.claude/clawborrator/session.json` on boot to rebind across
+/// `claude --resume`; an unwiped one would cause it to register with
+/// the dead session's id instead of the preflight one. Failures are
+/// silently ignored — they're advisory cleanup, not a hard prereq.
+fn clean_stale_persisted_files(folder: &Path) {
+    let persisted_path = folder.join(".claude").join("clawborrator").join("session.json");
     if persisted_path.exists() {
         let _ = std::fs::remove_file(&persisted_path);
     }
-    let legacy_sidecar = args.folder.join(".claude").join("clawborrator.session.json");
+    // Also nuke the legacy flat-file path earlier daemon builds wrote.
+    let legacy_sidecar = folder.join(".claude").join("clawborrator.session.json");
     if legacy_sidecar.exists() {
         let _ = std::fs::remove_file(&legacy_sidecar);
     }
+}
 
-    // Stage 1 — preflight: hub pre-allocates the sessionId AND
-    // mints the channel token in one call. We get back both
-    // pieces and don't have to wait for CC's MCP to register.
-    let pre = preflight(args.hub_url, args.pat, &args.folder.to_string_lossy(), args.machine_id, args.routing_name)
-        .await
-        .context("preflight")?;
-    info!(session_id = %pre.session_id, "preflight allocated session");
-
-    // Stage 2 — write the persisted-session file with the preflight
-    // sessionId. clawborrator-mcp reads `<cwd>/.claude/clawborrator/
-    // session.json` on boot via loadPersistedSessionId() and uses
-    // that id when registering against /channel WS — so by writing
-    // it here BEFORE spawning CC, the MCP's register frame carries
-    // the exact preflight sessionId and the hub's upsert binds to
-    // the existing preflight row instead of minting a sibling.
-    let persisted_dir = args.folder.join(".claude").join("clawborrator");
-    if let Err(e) = std::fs::create_dir_all(&persisted_dir) {
-        bail!("creating {} failed: {e}", persisted_dir.display());
-    }
-    // Drop a sibling .gitignore on first creation so the dir as a
-    // whole stays out of source control — same pattern the MCP
-    // uses, kept consistent so manual cleanup is symmetric.
+/// Drop the persisted-session JSON the MCP reads on boot, plus a
+/// `.gitignore` so the directory never ends up in source control.
+/// Has to run BEFORE spawning CC — the MCP reads this file in its
+/// register-frame path.
+fn write_persisted_session(
+    folder:       &Path,
+    session_id:   &str,
+    routing_name: Option<&str>,
+    hub_url:      &str,
+) -> Result<()> {
+    let persisted_dir = folder.join(".claude").join("clawborrator");
+    std::fs::create_dir_all(&persisted_dir)
+        .with_context(|| format!("creating {} failed", persisted_dir.display()))?;
     let gitignore = persisted_dir.join(".gitignore");
     if !gitignore.exists() {
         let _ = std::fs::write(&gitignore, "*\n");
     }
     let sidecar_path = persisted_dir.join("session.json");
     let sidecar_json = serde_json::json!({
-        "sessionId":  pre.session_id,
-        "routingName": args.routing_name,
-        "hubUrl":      hub_ws_url(args.hub_url),
+        "sessionId":   session_id,
+        "routingName": routing_name,
+        "hubUrl":      hub_ws_url(hub_url),
         "writtenAt":   chrono::Utc::now().to_rfc3339(),
     });
-    if let Err(e) = std::fs::write(&sidecar_path, serde_json::to_string_pretty(&sidecar_json)? + "\n") {
-        bail!("writing persisted-session {} failed: {e}", sidecar_path.display());
-    }
+    std::fs::write(&sidecar_path, serde_json::to_string_pretty(&sidecar_json)? + "\n")
+        .with_context(|| format!("writing persisted-session {} failed", sidecar_path.display()))?;
     info!(path = %sidecar_path.display(), "wrote persisted-session with preflight sessionId");
+    Ok(())
+}
 
-    // Stage 3 — write a daemon-managed .mcp.json with the
-    // preflight token. Per-session scratch dir under
-    // ~/.clawborrator/sessions/ so concurrent sessions don't
-    // collide.
+/// Mint a per-session scratch dir under `~/.clawborrator/sessions/<uuid>/`
+/// and drop a `.mcp.json` there pointing at the hub WS + carrying the
+/// preflight channel token. Returns `(scratch_dir, mcp_path)` —
+/// scratch_dir is held by the manager for cleanup on destroy; mcp_path
+/// is passed to `spawn_cc` as `--mcp-config <path>`.
+fn prepare_mcp_config(hub_url: &str, channel_token: &str) -> Result<(PathBuf, PathBuf)> {
     let scratch_dir = match dirs::home_dir() {
         Some(h) => h.join(".clawborrator").join("sessions").join(uuid::Uuid::new_v4().to_string()),
         None    => bail!("could not resolve home dir"),
     };
-    let ws_url = hub_ws_url(args.hub_url);
-    let mcp_path = write_mcp_json(&scratch_dir, &ws_url, &pre.channel_token)
+    let ws_url = hub_ws_url(hub_url);
+    let mcp_path = write_mcp_json(&scratch_dir, &ws_url, channel_token)
         .context("writing .mcp.json")?;
     info!(path = %mcp_path.display(), "wrote .mcp.json");
+    Ok((scratch_dir, mcp_path))
+}
 
-    // Stage 4 — spawn CC under a PTY.
-    let (master, child) = spawn_cc(&args.folder, &mcp_path, args.extra_flags)
-        .context("spawning claude")?;
-
-    // Stage 5 — wire reader + (optionally) auto-enter. Writer is
-    // shared between the session (owns it) and the auto-enter
-    // task (borrows via Arc<Mutex<...>>). Dropping the writer
-    // would close CC's stdin and exit CC, so the session retains
-    // the strong ref; when AUTO START is enabled, an additional
-    // task holds a clone for AUTO_ENTER_DURATION_MS.
-    //
-    // AUTO START: daemon presses Enter ~5x at 1s intervals to
-    //   dismiss CC's default-yes startup prompts (Trust folder,
-    //   Load MCP, Load dev channels). Fast path; assumes operator
-    //   wants the defaults.
-    // MANUAL START: no auto-enter. Operator drives the prompts
-    //   via the screenshot PIP keystroke capture or `claw session
-    //   input`. Required when a non-default answer is needed
-    //   (e.g. declining --dangerously-skip-permissions).
+/// Wire a vt100 parser onto the reader half of `master` (background
+/// thread) and return the parser + a shared `Arc<Mutex<Writer>>` the
+/// caller can hand both to the ManagedSession (owns it) and any
+/// auxiliary task (auto-enter, future input forwarders). Dropping
+/// the writer closes CC's stdin and exits CC — see ManagedSession's
+/// lifecycle commentary for why we wrap it instead of giving the
+/// auxiliary tasks ownership.
+fn wire_pty_io(
+    master: &(dyn portable_pty::MasterPty + Send),
+) -> Result<(Arc<Mutex<Parser>>, SharedWriter)> {
     let parser = Arc::new(Mutex::new(Parser::new(PTY_ROWS, PTY_COLS, 0)));
     let reader = master.try_clone_reader().map_err(|e| anyhow!("try_clone_reader: {e}"))?;
     spawn_pty_reader(reader, parser.clone());
-    let writer = Arc::new(Mutex::new(master.take_writer().map_err(|e| anyhow!("take_writer: {e}"))?));
+    let writer: SharedWriter = Arc::new(Mutex::new(
+        master.take_writer().map_err(|e| anyhow!("take_writer: {e}"))?,
+    ));
+    Ok((parser, writer))
+}
+
+pub async fn create_session(mgr: &SessionManager, args: CreateArgs<'_>) -> Result<String> {
+    precheck_create(mgr, &args)?;
+    clean_stale_persisted_files(&args.folder);
+
+    // Hub pre-allocates the sessionId AND mints the channel token in
+    // one call — we get back both pieces and don't have to wait for
+    // CC's MCP to register before knowing the id.
+    let pre = preflight(
+        args.hub_url, args.pat,
+        &args.folder.to_string_lossy(),
+        args.machine_id, args.routing_name,
+    ).await.context("preflight")?;
+    info!(session_id = %pre.session_id, "preflight allocated session");
+
+    // Order matters: the persisted-session file must exist BEFORE CC
+    // spawns so the MCP's register frame carries the preflight id and
+    // the hub's upsert rebinds to the preflight row instead of minting
+    // a sibling.
+    write_persisted_session(&args.folder, &pre.session_id, args.routing_name, args.hub_url)?;
+    let (scratch_dir, mcp_path) = prepare_mcp_config(args.hub_url, &pre.channel_token)?;
+    let (master, child) = spawn_cc(&args.folder, &mcp_path, args.extra_flags)
+        .context("spawning claude")?;
+
+    let (parser, writer) = wire_pty_io(&*master)?;
     if args.auto_enter {
+        // AUTO START: daemon presses Enter ~5x at 1s intervals to
+        // dismiss CC's default-yes startup prompts (Trust folder,
+        // Load MCP, Load dev channels). Fast path; assumes operator
+        // wants the defaults.
         info!("AUTO START — pressing Enter for {AUTO_ENTER_DURATION_MS}ms to dismiss startup prompts");
         spawn_auto_enter(writer.clone());
     } else {
+        // MANUAL START: operator drives the prompts via the screenshot
+        // PIP keystroke capture or `claw session input`. Required when
+        // a non-default answer is needed.
         info!("MANUAL START — operator will drive startup prompts via screenshot PIP / claw session input");
     }
 
-    // Stage 6 — register the live state in the manager. The
-    // sessionId is already known (from preflight), so we just
-    // insert and return immediately. SPA's `/sessions` poll will
-    // see the new row right away (it was inserted hub-side at
-    // preflight time); the operator can open the screenshot PIP,
-    // focus it, and answer CC's startup prompts manually.
     mgr.insert(pre.session_id.clone(), ManagedSession {
         _session_id:      pre.session_id.clone(),
         folder:           args.folder.clone(),
@@ -437,7 +460,7 @@ pub async fn create_session(mgr: &SessionManager, args: CreateArgs<'_>) -> Resul
         _writer:          writer,
         child,
         parser,
-        scratch_dir:      scratch_dir.clone(),
+        scratch_dir,
         channel_token_id: pre.channel_token_id,
     });
     Ok(pre.session_id)

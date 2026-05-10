@@ -25,6 +25,12 @@ use vt100::Parser;
 pub const PTY_ROWS: u16 = 40;
 pub const PTY_COLS: u16 = 120;
 
+/// Shared write-half of a PTY master. Wrapped in Arc<Mutex<…>> so the
+/// session (owns the lifetime) and any auxiliary task (auto-enter,
+/// future input forwarders) can safely poke bytes into CC's stdin.
+/// See ManagedSession's lifecycle commentary below for the why.
+pub type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
+
 // Session-scoped state.
 //
 // Lifecycle gotcha: `take_writer()` returns an OWNED writer that
@@ -44,7 +50,7 @@ pub struct ManagedSession {
     pub folder:           PathBuf,
     pub routing_name:     Option<String>,
     pub _master:          Box<dyn MasterPty + Send>,
-    pub _writer:          Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    pub _writer:          SharedWriter,
     pub child:            Box<dyn Child + Send + Sync>,
     pub parser:           Arc<Mutex<Parser>>,
     pub scratch_dir:      PathBuf,

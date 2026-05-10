@@ -25,6 +25,7 @@
 // AttachConsole — see `attach_parent_console_if_any`.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+mod auth;
 mod autostart;
 mod logging;
 mod oauth;
@@ -109,22 +110,22 @@ enum Command {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Config {
+pub(crate) struct Config {
     /// Stable per-install identifier. Generated once on first run;
     /// persists across daemon restarts. NOT keyed off hostname so
     /// that a hostname change doesn't orphan the registration.
-    machine_id: String,
+    pub(crate) machine_id: String,
     /// `cw_app_…` Bearer token minted via the OAuth flow on first
     /// run. Optional only because the file is created BEFORE the
     /// flow runs (so we have a stable machine_id during the
     /// browser round-trip). Once the OAuth flow completes the
     /// token is written back via `save_config`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
+    pub(crate) token: Option<String>,
     /// Hub URL the token was minted against. Lets us refuse to
     /// reuse a token when the operator changes hub URLs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    hub_url: Option<String>,
+    pub(crate) hub_url: Option<String>,
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -299,19 +300,34 @@ async fn run_session(ctx: &DaemonCtx, ws_url: &Url, cfg: &Config) -> Result<()> 
             }
             msg = ws.next() => {
                 let Some(msg) = msg else { return Err(anyhow!("ws stream ended")); };
-                match msg? {
-                    Message::Text(text)   => handle_text(ctx, &mut ws, &text).await?,
-                    Message::Binary(_)    => warn!("ignoring unexpected binary frame"),
-                    Message::Ping(p)      => ws.send(Message::Pong(p)).await?,
-                    Message::Pong(_)      => (),
-                    Message::Close(frame) => {
-                        info!(?frame, "hub closed the connection");
-                        return Ok(());
-                    }
-                    Message::Frame(_)     => (),
+                if !handle_ws_message(ctx, &mut ws, msg?).await? {
+                    return Ok(());
                 }
             }
         }
+    }
+}
+
+/// WS-frame demux. Pulled out of `run_session`'s `tokio::select!` arm
+/// so the loop body stays flat and the per-variant handling lives in
+/// one place. Returns `Ok(true)` to keep looping; `Ok(false)` for a
+/// clean exit (hub-initiated Close); `Err` for protocol failures the
+/// caller should propagate.
+async fn handle_ws_message<S>(
+    ctx: &DaemonCtx,
+    ws:  &mut tokio_tungstenite::WebSocketStream<S>,
+    msg: Message,
+) -> Result<bool>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match msg {
+        Message::Text(text)   => { handle_text(ctx, ws, &text).await?; Ok(true) }
+        Message::Binary(_)    => { warn!("ignoring unexpected binary frame"); Ok(true) }
+        Message::Ping(p)      => { ws.send(Message::Pong(p)).await?; Ok(true) }
+        Message::Pong(_)      => Ok(true),
+        Message::Close(frame) => { info!(?frame, "hub closed the connection"); Ok(false) }
+        Message::Frame(_)     => Ok(true),
     }
 }
 
@@ -552,46 +568,30 @@ async fn run_subcommand(cli: &Cli, cmd: Command) -> Result<()> {
 
 async fn cmd_login(cli: &Cli, force: bool) -> Result<()> {
     let mut cfg = load_or_init_config()?;
-
-    if !force && token_matches_hub(&cfg, &cli.hub_url) {
-        match fetch_user_login(&cli.hub_url, cfg.token.as_deref().unwrap()).await {
-            Ok(login) => {
-                eprintln!("Already logged in as {} at {}.", login, cli.hub_url);
-                eprintln!("Pass --force to re-authenticate.");
-                return Ok(());
+    match auth::login(&mut cfg, &cli.hub_url, force).await? {
+        auth::LoginOutcome::AlreadyLoggedIn { login } => {
+            eprintln!("Already logged in as {} at {}.", login, cli.hub_url);
+            eprintln!("Pass --force to re-authenticate.");
+        }
+        auth::LoginOutcome::Authenticated { login } => {
+            save_config(&cfg)?;
+            match login {
+                Some(l) => eprintln!("Logged in as {} at {}.", l, cli.hub_url),
+                None    => eprintln!("Logged in (couldn't confirm identity via /api/v1/me)."),
             }
-            Err(e) => eprintln!("Cached token rejected by hub ({e}); re-authenticating."),
+            eprintln!("Run `install-task` next if you want the daemon to launch at logon.");
         }
     }
-
-    let token = oauth::run_oauth_flow(&cli.hub_url).await
-        .with_context(|| "OAuth login failed")?;
-    cfg.token   = Some(token.clone());
-    cfg.hub_url = Some(cli.hub_url.clone());
-    save_config(&cfg)?;
-
-    match fetch_user_login(&cli.hub_url, &token).await {
-        Ok(login) => eprintln!("Logged in as {} at {}.", login, cli.hub_url),
-        Err(e)    => eprintln!("Logged in (couldn't confirm identity via /api/v1/me: {e})"),
-    }
-    eprintln!("Run `install-task` next if you want the daemon to launch at logon.");
     Ok(())
 }
 
 async fn cmd_logout(cli: &Cli) -> Result<()> {
     let mut cfg = load_or_init_config()?;
-
-    if let Some(token) = cfg.token.clone() {
-        match revoke_token(&cli.hub_url, &token).await {
-            Ok(()) => eprintln!("Hub revoked the token."),
-            Err(e) => warn!(?e, "hub /auth/logout failed; clearing local cache anyway"),
-        }
-    } else {
-        eprintln!("No cached token; nothing to revoke server-side.");
+    match auth::logout(&mut cfg, &cli.hub_url).await {
+        auth::LogoutOutcome::Revoked         => eprintln!("Hub revoked the token."),
+        auth::LogoutOutcome::NoCachedToken   => eprintln!("No cached token; nothing to revoke server-side."),
+        auth::LogoutOutcome::RevokeFailed(e) => warn!(?e, "hub /auth/logout failed; clearing local cache anyway"),
     }
-
-    cfg.token   = None;
-    cfg.hub_url = None;
     save_config(&cfg)?;
     eprintln!("Local config cleared. machine_id preserved.");
 
@@ -599,46 +599,6 @@ async fn cmd_logout(cli: &Cli) -> Result<()> {
     if let Ok(autostart::AutostartStatus::Installed { .. }) = provider.status() {
         eprintln!("Note: autostart is still installed — without a token the daemon will fail at next logon.");
         eprintln!("Run `uninstall-task` to remove it, or `login` to mint a fresh token.");
-    }
-    Ok(())
-}
-
-fn token_matches_hub(cfg: &Config, hub_url: &str) -> bool {
-    cfg.token.is_some() && cfg.hub_url.as_deref() == Some(hub_url)
-}
-
-/// GET /api/v1/me — returns `githubLogin`. Used after login to confirm
-/// the token works AND to surface the resolved user to the operator.
-async fn fetch_user_login(hub_url: &str, token: &str) -> Result<String> {
-    let url = Url::parse(hub_url)?.join("/api/v1/me")?;
-    let resp = reqwest::Client::new()
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("GET /api/v1/me")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("hub returned {}", resp.status());
-    }
-    let body: serde_json::Value = resp.json().await.context("parsing /api/v1/me response")?;
-    body.get("githubLogin")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("missing githubLogin in /me response"))
-}
-
-/// POST /api/v1/auth/logout — revokes the bearer token server-side.
-/// Idempotent on the hub; this just translates HTTP errors to anyhow.
-async fn revoke_token(hub_url: &str, token: &str) -> Result<()> {
-    let url = Url::parse(hub_url)?.join("/api/v1/auth/logout")?;
-    let resp = reqwest::Client::new()
-        .post(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("POST /api/v1/auth/logout")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("hub returned {}", resp.status());
     }
     Ok(())
 }
