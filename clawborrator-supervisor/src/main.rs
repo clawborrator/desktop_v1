@@ -52,6 +52,8 @@ use crate::sessions::SessionManager;
 use crate::spawn::{create_session, destroy_session, input_session, kill_session, restart_session, screenshot_session, CreateArgs};
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+// Note: DAEMON_VERSION is sourced from Cargo.toml, so a version bump
+// in Cargo.toml flows automatically to the hello frame + --version.
 const DEFAULT_HUB_URL: &str = "https://next.clawborrator.com";
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);

@@ -12,9 +12,14 @@
 //
 //   menu-event drainer (side thread):
 //     loops on `MenuEvent::receiver()`, dispatches per item:
-//       Open dashboard → opens hub URL in default browser
-//       View log       → opens supervisor.log in default app
-//       Quit           → flips the shutdown watch + PostQuitMessage
+//       Open dashboard   → opens hub URL in default browser
+//       Open log folder  → opens %LOCALAPPDATA%/clawborrator/ in
+//                          Explorer (the daily-rolled files inside
+//                          are named supervisor.log.YYYY-MM-DD;
+//                          opening a single file directly would
+//                          either name the wrong day or 404 on day
+//                          rollover, so we let the operator pick)
+//       Quit             → flips the shutdown watch + PostQuitMessage
 //
 //   tokio worker thread:
 //     owns the `run_daemon` future. `tokio::select!`s the daemon
@@ -134,9 +139,9 @@ fn build_menu() -> Result<(Menu, MenuIds)> {
     menu.append(&header).map_err(menu_err)?;
     menu.append(&PredefinedMenuItem::separator()).map_err(menu_err)?;
 
-    let dashboard = MenuItem::with_id("dashboard", "Open dashboard", true, None);
-    let log       = MenuItem::with_id("log",       "View log",       true, None);
-    let quit      = MenuItem::with_id("quit",      "Quit",            true, None);
+    let dashboard = MenuItem::with_id("dashboard", "Open dashboard",  true, None);
+    let log       = MenuItem::with_id("log",       "Open log folder", true, None);
+    let quit      = MenuItem::with_id("quit",      "Quit",             true, None);
 
     menu.append(&dashboard).map_err(menu_err)?;
     menu.append(&log).map_err(menu_err)?;
@@ -193,7 +198,13 @@ fn drain_menu_events(
                     warn!(?e, hub_url = %hub_url, "failed to open dashboard");
                 }
             }
-            MenuAction::OpenLog => open_path(&log_path),
+            // The log file is daily-rolled by tracing_appender — actual
+            // names are `supervisor.log.YYYY-MM-DD`, so the bare
+            // `supervisor.log` path the rest of the daemon carries
+            // around as a label doesn't exist on disk. Open the
+            // containing folder instead so the operator can pick the
+            // current day's file (or scroll back through the history).
+            MenuAction::OpenLog => open_path(log_path.parent().unwrap_or(&log_path)),
             MenuAction::Quit => {
                 info!("tray Quit clicked");
                 let _ = shutdown_tx.send(true);
