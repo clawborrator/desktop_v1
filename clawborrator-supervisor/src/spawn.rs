@@ -489,11 +489,12 @@ pub fn kill_session(mgr: &SessionManager, session_id: &str) -> Result<()> {
 /// pre-kill history). Operators wanting history-preserving
 /// restart should use `kill` + manually re-create.
 ///
-/// `auto_enter` is forwarded by the hub from the persisted
-/// sessions.auto_enter column, so a session created with
-/// MANUAL START restarts manual instead of silently flipping
-/// to auto. Older hubs that don't pass it default to true via
-/// the SessionRestartArgs deserializer.
+/// `auto_enter` and `extra_flags` are forwarded by the hub from the
+/// persisted sessions.auto_enter and sessions.extra_flags columns, so
+/// a Restart preserves both the prompt-handling mode AND the operator's
+/// CLI flags (--model, --add-dir, etc.) instead of silently dropping
+/// them. Older hubs that don't pass them default to auto_enter=true
+/// and extra_flags=[] via the SessionRestartArgs deserializer.
 pub async fn restart_session(
     mgr: &SessionManager,
     hub_url: &str,
@@ -501,6 +502,7 @@ pub async fn restart_session(
     machine_id: &str,
     session_id: &str,
     auto_enter: bool,
+    extra_flags: &[String],
 ) -> Result<String> {
     // Snapshot the args BEFORE destroy_session pulls the entry out
     // of the manager.
@@ -522,18 +524,14 @@ pub async fn restart_session(
 
     // Now spawn fresh in the same folder. The new sessionId is
     // returned to the hub, which forwards it to the SPA so the
-    // operator can be auto-selected onto the new row. Restart
-    // does NOT carry over extra_flags from the original create —
-    // a deliberate gap; if you need the same flags after a
-    // restart, recreate from the SPA. (We could persist them on
-    // the session row later if it becomes a pain point.)
+    // operator can be auto-selected onto the new row.
     create_session(mgr, CreateArgs {
         hub_url,
         pat,
         machine_id,
         folder,
         routing_name: routing_name.as_deref(),
-        extra_flags:  &[],
+        extra_flags,
         auto_enter,
     }).await
 }
