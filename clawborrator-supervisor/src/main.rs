@@ -385,6 +385,20 @@ struct SessionRefArgs {
     session_id: String,
 }
 
+/// Restart-only args: session id + the operator's persisted
+/// AUTO/MANUAL choice. The hub reads `auto_enter` off the sessions
+/// row and forwards it here so a session created with manual-start
+/// doesn't silently flip back to auto on Restart. Default true keeps
+/// older hubs (and direct-CLI testing) on the prior implicit
+/// behavior.
+#[derive(Deserialize)]
+struct SessionRestartArgs {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(default = "default_true", rename = "autoEnter")]
+    auto_enter: bool,
+}
+
 /// Dispatch helpers detect "no managed session" errors (the
 /// SessionManager's miss path) and map them to a specific
 /// `session_not_found` code. Hub-side orphan-restart relies on
@@ -436,8 +450,8 @@ async fn dispatch_session_destroy(ctx: &DaemonCtx, args: serde_json::Value) -> s
 }
 
 async fn dispatch_session_restart(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
-    let parsed: SessionRefArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
-    match restart_session(&ctx.mgr, &ctx.hub_url, &ctx.pat, &ctx.machine_id, &parsed.session_id).await {
+    let parsed: SessionRestartArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
+    match restart_session(&ctx.mgr, &ctx.hub_url, &ctx.pat, &ctx.machine_id, &parsed.session_id, parsed.auto_enter).await {
         Ok(new_id) => Ok(serde_json::json!({ "sessionId": new_id })),
         Err(e)     => Err(classify_dispatch_err("restart_failed", e)),
     }

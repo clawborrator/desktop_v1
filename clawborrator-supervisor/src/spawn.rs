@@ -488,12 +488,19 @@ pub fn kill_session(mgr: &SessionManager, session_id: &str) -> Result<()> {
 /// folder; the old row is hard-deleted (along with its short
 /// pre-kill history). Operators wanting history-preserving
 /// restart should use `kill` + manually re-create.
+///
+/// `auto_enter` is forwarded by the hub from the persisted
+/// sessions.auto_enter column, so a session created with
+/// MANUAL START restarts manual instead of silently flipping
+/// to auto. Older hubs that don't pass it default to true via
+/// the SessionRestartArgs deserializer.
 pub async fn restart_session(
     mgr: &SessionManager,
     hub_url: &str,
     pat: &str,
     machine_id: &str,
     session_id: &str,
+    auto_enter: bool,
 ) -> Result<String> {
     // Snapshot the args BEFORE destroy_session pulls the entry out
     // of the manager.
@@ -527,11 +534,7 @@ pub async fn restart_session(
         folder,
         routing_name: routing_name.as_deref(),
         extra_flags:  &[],
-        // Restart always runs AUTO START — this is a re-spawn of
-        // a session the operator already greenlit. Manual prompts
-        // would force them to re-answer the trust/MCP gates every
-        // restart, which is friction without value.
-        auto_enter:   true,
+        auto_enter,
     }).await
 }
 
