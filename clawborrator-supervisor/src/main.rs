@@ -50,7 +50,7 @@ use tracing::{error, info, warn};
 use url::Url;
 
 use crate::sessions::SessionManager;
-use crate::spawn::{create_session, destroy_session, input_session, kill_session, restart_session, screenshot_session, CreateArgs};
+use crate::spawn::{create_session, destroy_session, input_session, kill_session, restart_session, screenshot_session, soft_restart_session, CreateArgs};
 use crate::status::{TrayStatus, TrayStatusUpdater};
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -302,7 +302,7 @@ async fn run_session(ctx: &DaemonCtx, ws_url: &Url, cfg: &Config) -> Result<()> 
         machine_id:       &cfg.machine_id,
         daemon_version:   DAEMON_VERSION,
         hostname:         &host,
-        capabilities:     &["session.create", "session.kill", "session.destroy", "session.restart", "session.screenshot", "session.input"],
+        capabilities:     &["session.create", "session.kill", "session.destroy", "session.restart", "session.softrestart", "session.screenshot", "session.input"],
         current_sessions: &current_sessions,
     };
     ws.send(Message::Text(serde_json::to_string(&hello)?)).await?;
@@ -491,6 +491,21 @@ async fn dispatch_session_restart(ctx: &DaemonCtx, args: serde_json::Value) -> s
     }
 }
 
+/// Soft-restart: SIGKILL the child + respawn CC against the existing
+/// scratch dir / identity.json / channel token, so the new MCP
+/// registers with the SAME sessionId. Hub gates eligibility (the
+/// session row must have preserve_session_id=true); daemon trusts
+/// that gate and does the spawn unconditionally. Reuses
+/// SessionRestartArgs (sessionId + autoEnter + extraFlags) since the
+/// arg shape is identical.
+async fn dispatch_session_softrestart(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
+    let parsed: SessionRestartArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
+    match soft_restart_session(&ctx.mgr, &parsed.session_id, parsed.auto_enter, &parsed.extra_flags).await {
+        Ok(()) => Ok(serde_json::json!({ "sessionId": parsed.session_id, "softRestarted": true })),
+        Err(e) => Err(classify_dispatch_err("soft_restart_failed", e)),
+    }
+}
+
 fn dispatch_session_screenshot(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
     let parsed: SessionRefArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
     match screenshot_session(&ctx.mgr, &parsed.session_id) {
@@ -533,7 +548,8 @@ where
         "session.create"     => dispatch_session_create(ctx, args).await,
         "session.kill"       => dispatch_session_kill(ctx, args),
         "session.destroy"    => dispatch_session_destroy(ctx, args).await,
-        "session.restart"    => dispatch_session_restart(ctx, args).await,
+        "session.restart"     => dispatch_session_restart(ctx, args).await,
+        "session.softrestart" => dispatch_session_softrestart(ctx, args).await,
         "session.screenshot" => dispatch_session_screenshot(ctx, args),
         "session.input"      => dispatch_session_input(ctx, args),
         other                => Err(("unknown_op".into(), format!("unknown op: {other}"))),

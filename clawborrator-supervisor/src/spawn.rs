@@ -476,6 +476,70 @@ pub async fn create_session(mgr: &SessionManager, args: CreateArgs<'_>) -> Resul
     Ok(pre.session_id)
 }
 
+/// Soft-restart: SIGKILL the PTY child, then respawn CC against the
+/// EXISTING scratch dir's .mcp.json (which still holds the original
+/// channel token) and the EXISTING <cwd>/.claude/clawborrator/
+/// identity.json (which still holds the original sessionId). The new
+/// CC's MCP reads identity.json on boot and registers with the SAME
+/// sessionId; the hub's UPSERT-on-register path rebinds to the
+/// existing session row → history preserved, agent.session_id stays
+/// bound, webhook routingName matches keep firing, channel token
+/// stays alive.
+///
+/// Eligible only for sessions whose row has preserve_session_id=true
+/// — the hub gates the RPC. Unlike restart_session, this does NOT
+/// call destroy_session: scratch dir, persisted-session, channel
+/// token all survive the cycle. Failure modes:
+///   - channel token externally revoked → new MCP fails to register;
+///     surfaces as the WS never reaching welcome. Operator escalates
+///     to hard reset (POST /restart) which mints a fresh token.
+///   - identity.json externally deleted → new MCP mints a sibling
+///     sessionId; the swap below leaves the in-mem ManagedSession
+///     keyed by the OLD id. Pathological; operator should hard reset.
+pub async fn soft_restart_session(
+    mgr:         &SessionManager,
+    session_id:  &str,
+    auto_enter:  bool,
+    extra_flags: &[String],
+) -> Result<()> {
+    let entry = mgr.get(session_id)?;
+    let (folder, scratch_dir) = {
+        let s = entry.lock().unwrap();
+        (s.folder.clone(), s.scratch_dir.clone())
+    };
+
+    // Kill the old child. Non-blocking on portable-pty; the OS will
+    // reap. Logging-only on error — the new spawn proceeds either way.
+    {
+        let mut s = entry.lock().unwrap();
+        if let Err(e) = s.child.kill() {
+            warn!(?e, session_id, "failed to kill old child during soft-restart; continuing");
+        }
+    }
+
+    let mcp_path = scratch_dir.join(".mcp.json");
+    let (master, child) = spawn_cc(&folder, &mcp_path, extra_flags)
+        .with_context(|| "spawning claude (soft-restart)")?;
+    let (parser, writer) = wire_pty_io(&*master)?;
+    if auto_enter {
+        info!("soft-restart AUTO START — pressing Enter for {AUTO_ENTER_DURATION_MS}ms");
+        spawn_auto_enter(writer.clone());
+    }
+
+    // Swap new PTY/child/reader/writer into the existing entry.
+    // _session_id, folder, routing_name, scratch_dir, channel_token_id
+    // all stay the same — that's the whole point of soft-restart.
+    {
+        let mut s = entry.lock().unwrap();
+        s._master = master;
+        s.child   = child;
+        s.parser  = parser;
+        s._writer = writer;
+    }
+    info!(session_id, "soft-restarted CC (sessionId preserved)");
+    Ok(())
+}
+
 pub fn kill_session(mgr: &SessionManager, session_id: &str) -> Result<()> {
     let entry = mgr.remove(session_id)
         .ok_or_else(|| anyhow!("no managed session with id {session_id}"))?;
