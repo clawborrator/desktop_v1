@@ -31,6 +31,7 @@ mod logging;
 mod oauth;
 mod sessions;
 mod spawn;
+mod status;
 #[cfg(target_os = "windows")] mod tray;
 
 use std::path::PathBuf;
@@ -50,6 +51,7 @@ use url::Url;
 
 use crate::sessions::SessionManager;
 use crate::spawn::{create_session, destroy_session, input_session, kill_session, restart_session, screenshot_session, CreateArgs};
+use crate::status::{TrayStatus, TrayStatusUpdater};
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 // Note: DAEMON_VERSION is sourced from Cargo.toml, so a version bump
@@ -243,6 +245,15 @@ enum InFrame {
         op:   String,
         #[serde(default)] args: serde_json::Value,
     },
+    /// Hub-side rejection. Today's known codes:
+    ///   - "auth_failed" — bearer token rejected (post-login revoke,
+    ///     desktop-delete, or stale post-rotation token). Reconnects
+    ///     will keep failing until the operator re-authenticates;
+    ///     surface to the tray so it's visible without log-diving.
+    Error {
+        code: String,
+        #[serde(default)] message: Option<String>,
+    },
     /// Catch-all so unknown frames don't kill the connection.
     #[serde(other)]
     Unknown,
@@ -256,6 +267,12 @@ struct DaemonCtx {
     pub pat:        String,
     pub machine_id: String,
     pub mgr:        Arc<SessionManager>,
+    /// Send-side of the tray status channel. The daemon thread
+    /// publishes connect-state transitions here; on Windows the
+    /// tray's watcher thread consumes them. On non-Windows / CLI
+    /// subcommand paths this is a noop, so call sites don't have
+    /// to cfg-gate.
+    pub tray:       TrayStatusUpdater,
 }
 
 async fn run_session(ctx: &DaemonCtx, ws_url: &Url, cfg: &Config) -> Result<()> {
@@ -265,6 +282,7 @@ async fn run_session(ctx: &DaemonCtx, ws_url: &Url, cfg: &Config) -> Result<()> 
         .unwrap_or_else(|| "unknown".to_string());
 
     info!(url = %ws_url, "connecting to /supervisor");
+    ctx.tray.set(TrayStatus::Connecting);
 
     let mut request: Request = ws_url.as_str().into_client_request()?;
     request.headers_mut().insert(
@@ -347,6 +365,7 @@ where
     match parsed {
         InFrame::HelloAck { user_login, message } => {
             info!(?user_login, ?message, "registered with hub");
+            ctx.tray.set(TrayStatus::Connected);
         }
         InFrame::Ping => {
             ws.send(Message::Text(serde_json::to_string(&OutFrame::Pong)?)).await?;
@@ -354,6 +373,17 @@ where
         InFrame::Pong => { /* application-level pong; nothing to do */ }
         InFrame::Cmd { id, op, args } => {
             handle_cmd(ctx, ws, &id, &op, args).await?;
+        }
+        InFrame::Error { code, message } => {
+            if code == "auth_failed" {
+                ctx.tray.set(TrayStatus::AuthFailed);
+                error!(
+                    code = %code, msg = ?message,
+                    "hub rejected our token; re-run `clawborrator-supervisor login` and restart the daemon (in-memory token doesn't refresh from disk)"
+                );
+            } else {
+                warn!(code = %code, msg = ?message, "hub returned error frame");
+            }
         }
         InFrame::Unknown => {
             warn!(raw = text, "received unknown frame");
@@ -655,7 +685,7 @@ fn task_status(provider: &dyn autostart::AutostartProvider) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn run_daemon(cli: Cli) -> Result<()> {
+pub(crate) async fn run_daemon(cli: Cli, tray: TrayStatusUpdater) -> Result<()> {
     let mut cfg = load_or_init_config()?;
     if let Some(forced) = cli.machine_id.clone() { cfg.machine_id = forced; }
     info!(machine_id = %cfg.machine_id, daemon = DAEMON_VERSION, "starting");
@@ -668,6 +698,7 @@ pub(crate) async fn run_daemon(cli: Cli) -> Result<()> {
         pat:        token,
         machine_id: cfg.machine_id.clone(),
         mgr:        Arc::new(SessionManager::new()),
+        tray,
     };
 
     tokio::select! {
@@ -708,13 +739,14 @@ fn main() -> Result<()> {
 
     // Non-Windows: no tray yet — tokio on main, run the daemon
     // directly. macOS/Linux tray support lands when their autostart
-    // facilities do (PR4+).
+    // facilities do (PR4+). Pass a noop status updater so the
+    // daemon's call sites don't have to cfg-gate.
     #[cfg(not(target_os = "windows"))]
     {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .context("building tokio runtime")?;
-        runtime.block_on(run_daemon(cli))
+        runtime.block_on(run_daemon(cli, TrayStatusUpdater::noop()))
     }
 }

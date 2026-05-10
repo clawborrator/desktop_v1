@@ -31,21 +31,23 @@
 // would conflict with `tray-icon`'s own internal HWND.
 
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
-    Icon, TrayIconBuilder,
+    Icon, TrayIcon, TrayIconBuilder,
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PostQuitMessage, PostThreadMessageW, TranslateMessage,
-    MSG, WM_QUIT,
+    DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, PostQuitMessage,
+    PostThreadMessageW, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT, WM_QUIT,
 };
 
 use crate::Cli;
+use crate::status::{TrayStatus, TrayStatusUpdater};
 
 const TRAY_PNG: &[u8] = include_bytes!("../assets/tray.png");
 const TOOLTIP:  &str  = "clawborrator-supervisor";
@@ -54,6 +56,18 @@ struct MenuIds {
     dashboard: MenuId,
     log:       MenuId,
     quit:      MenuId,
+}
+
+/// Refs the status-watcher thread mutates when the daemon publishes
+/// a `TrayStatus` change. Cloned out of `build_menu`/`run_with_tray`
+/// so the watcher thread owns its own handles.
+struct StatusUiHandles {
+    /// The disabled header menu item; gets `set_text` to reflect
+    /// "connecting…" / "connected" / "AUTH FAILED — run `login`".
+    header: MenuItem,
+    /// The tray icon itself; gets `set_tooltip` so the same status
+    /// is visible on hover even when the menu isn't open.
+    tray:   TrayIcon,
 }
 
 /// Run the daemon with a system-tray UI on Windows. Blocks the main
@@ -67,6 +81,7 @@ pub fn run_with_tray(cli: Cli, log_path: PathBuf) -> Result<()> {
         .context("building tokio runtime")?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (status_updater, status_rx) = TrayStatusUpdater::channel();
     let hub_url = cli.hub_url.clone();
 
     // Capture the main thread id BEFORE spawning workers so the
@@ -78,12 +93,15 @@ pub fn run_with_tray(cli: Cli, log_path: PathBuf) -> Result<()> {
 
     // Tokio worker — owns the daemon future. `select!` lets a tray
     // Quit unwind through the future's drop chain instead of going
-    // through std::process::exit.
+    // through std::process::exit. The status updater lets the
+    // daemon's WS reader push connect-state transitions to the
+    // tray's watcher thread (below).
+    let daemon_status = status_updater.clone();
     let daemon_handle = thread::spawn(move || -> Result<()> {
         let res = runtime.block_on(async move {
             let mut shutdown_rx = shutdown_rx;
             tokio::select! {
-                res = crate::run_daemon(cli) => res,
+                res = crate::run_daemon(cli, daemon_status) => res,
                 _   = shutdown_rx.changed() => {
                     info!("tray Quit received; shutting down daemon");
                     Ok(())
@@ -99,9 +117,9 @@ pub fn run_with_tray(cli: Cli, log_path: PathBuf) -> Result<()> {
     });
 
     // Build tray + menu on the main thread.
-    let (menu, ids) = build_menu()?;
+    let (menu, ids, header) = build_menu()?;
     let icon = decode_icon().context("decoding embedded tray icon")?;
-    let _tray = TrayIconBuilder::new()
+    let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(TOOLTIP)
         .with_icon(icon)
@@ -115,10 +133,14 @@ pub fn run_with_tray(cli: Cli, log_path: PathBuf) -> Result<()> {
         move || drain_menu_events(ids, hub_url, log_path, shutdown_tx)
     });
 
-    // Main thread: Win32 message pump. Returns when WM_QUIT arrives
-    // (PostQuitMessage from the menu-event drainer or from Windows
-    // shutdown).
-    run_message_loop();
+    // tray-icon's TrayIcon and MenuItem are Rc<RefCell<...>> — they
+    // can ONLY be mutated from the thread that built them (this one,
+    // main). So instead of spawning a watcher thread, the message
+    // loop itself drains pending TrayStatus events between message
+    // dispatches. Status latency is bounded by the loop's wakeup
+    // interval (250ms) — fine for human perception.
+    let handles = StatusUiHandles { header, tray };
+    run_message_loop_with_status(handles, status_rx);
 
     // Tray exited; tell the daemon if it hasn't already noticed and
     // collect its result. join().unwrap() because the daemon thread
@@ -129,13 +151,14 @@ pub fn run_with_tray(cli: Cli, log_path: PathBuf) -> Result<()> {
     }
 }
 
-fn build_menu() -> Result<(Menu, MenuIds)> {
+fn build_menu() -> Result<(Menu, MenuIds, MenuItem)> {
     let menu = Menu::new();
 
-    // Header item — disabled, just labels what's running. Cheap
-    // affordance: makes the menu feel intentional rather than just
-    // "Quit" floating in space.
-    let header = MenuItem::new("clawborrator-supervisor", false, None);
+    // Header item — disabled. Initial label is the connect placeholder;
+    // the status-watcher thread mutates this text on each
+    // TrayStatus transition (connecting / connected / AUTH FAILED).
+    // Returned to the caller so the watcher can hold its own clone.
+    let header = MenuItem::new("clawborrator-supervisor — starting…", false, None);
     menu.append(&header).map_err(menu_err)?;
     menu.append(&PredefinedMenuItem::separator()).map_err(menu_err)?;
 
@@ -152,7 +175,24 @@ fn build_menu() -> Result<(Menu, MenuIds)> {
         dashboard: dashboard.id().clone(),
         log:       log.id().clone(),
         quit:      quit.id().clone(),
-    }))
+    }, header))
+}
+
+/// Apply each pending `TrayStatus` to the menu header text + tray
+/// tooltip. Best-effort — `set_tooltip` errors are swallowed (the
+/// tray-icon crate occasionally returns transient ones during menu
+/// rebuilds; not worth crashing the loop over). Drained in chunks
+/// inside `run_message_loop_with_status` so all UI mutation stays
+/// on the main thread.
+fn apply_pending_status(handles: &StatusUiHandles, rx: &Receiver<TrayStatus>) {
+    while let Ok(status) = rx.try_recv() {
+        let header_text  = format!("clawborrator-supervisor — {}", status.label());
+        let tooltip_text = status.tooltip();
+        handles.header.set_text(&header_text);
+        if let Err(e) = handles.tray.set_tooltip(Some(&tooltip_text)) {
+            warn!(?e, "tray set_tooltip failed");
+        }
+    }
 }
 
 fn menu_err(e: tray_icon::menu::Error) -> anyhow::Error {
@@ -234,16 +274,37 @@ fn open_path(path: &std::path::Path) {
     }
 }
 
-fn run_message_loop() {
+/// Win32 message pump that ALSO drains pending TrayStatus updates
+/// from the daemon. We can't spawn a separate watcher thread because
+/// tray-icon's TrayIcon + MenuItem are Rc<RefCell<…>> (not Send) —
+/// every UI mutation has to happen on the thread that built them.
+///
+/// Loop shape: `MsgWaitForMultipleObjects` blocks for up to 250ms
+/// waiting for either a Win32 message OR the timer. On wake-up we
+/// drain queued status updates first, then process all pending Win32
+/// messages with `PeekMessageW(PM_REMOVE)`. Loop exits on WM_QUIT.
+fn run_message_loop_with_status(
+    handles:   StatusUiHandles,
+    status_rx: Receiver<TrayStatus>,
+) {
+    const STATUS_POLL_MS: u32 = 250;
     unsafe {
-        let mut msg: MSG = std::mem::zeroed();
         loop {
-            let r = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
-            // GetMessageW returns 0 on WM_QUIT, -1 on error, >0 otherwise.
-            // We treat both 0 and -1 as "stop pumping".
-            if r <= 0 { return; }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            // Wake when EITHER a Win32 message arrives OR ~250ms
+            // has passed (so we pick up channel updates with bounded
+            // latency even when no menu activity is happening).
+            let _ = MsgWaitForMultipleObjects(0, std::ptr::null(), 0, STATUS_POLL_MS, QS_ALLINPUT);
+
+            apply_pending_status(&handles, &status_rx);
+
+            // Drain everything Win32 has queued for us. PeekMessageW
+            // returns 0 when the queue is empty.
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if msg.message == WM_QUIT { return; }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 }
