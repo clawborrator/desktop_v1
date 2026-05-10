@@ -14,7 +14,7 @@
 //      auto-answer task that hammers Enter for 10 seconds (to
 //      acknowledge CC's startup prompts). Categorized
 //      startupAnswers will replace the dumb hammer in a follow-on.
-//   5. Poll <folder>/.claude/clawborrator.session.json for up to
+//   5. Poll <folder>/.claude/clawborrator/runtime.json for up to
 //      30 seconds for the resolved hub session id (CC's MCP writes
 //      it on register). Return that id once present.
 //
@@ -270,7 +270,7 @@ fn spawn_auto_enter(writer: SharedWriter) {
 
 #[allow(dead_code)]
 async fn poll_sidecar(folder: &PathBuf) -> Result<String> {
-    let sidecar = folder.join(".claude").join("clawborrator.session.json");
+    let sidecar = folder.join(".claude").join("clawborrator").join("runtime.json");
     let deadline = Instant::now() + Duration::from_millis(SIDECAR_POLL_TIMEOUT_MS);
     while Instant::now() < deadline {
         if sidecar.exists() {
@@ -314,7 +314,7 @@ pub struct CreateArgs<'a> {
 
 /// Refuse the create if the folder is bogus or another managed
 /// session is already running there. Two CC instances in the same
-/// folder race on `.claude/clawborrator/session.json` and produce
+/// folder race on `.claude/clawborrator/identity.json` and produce
 /// undefined behavior — at best the second create's RPC times out;
 /// at worst it binds to the first session.
 fn precheck_create(mgr: &SessionManager, args: &CreateArgs<'_>) -> Result<()> {
@@ -332,20 +332,30 @@ fn precheck_create(mgr: &SessionManager, args: &CreateArgs<'_>) -> Result<()> {
 
 /// Best-effort wipe of stale persisted-session files left behind by a
 /// previous session in the same folder. The MCP reads
-/// `<cwd>/.claude/clawborrator/session.json` on boot to rebind across
+/// `<cwd>/.claude/clawborrator/identity.json` on boot to rebind across
 /// `claude --resume`; an unwiped one would cause it to register with
 /// the dead session's id instead of the preflight one. Failures are
 /// silently ignored — they're advisory cleanup, not a hard prereq.
+///
+/// Also nukes two legacy paths from earlier daemon/MCP builds:
+///   - `<cwd>/.claude/clawborrator/session.json` (pre-0.2.4 identity)
+///   - `<cwd>/.claude/clawborrator.session.json`  (pre-0.2.4 hook sidecar)
+/// — so existing sessions don't leak cruft when their first restart
+/// runs under the new daemon. Forward-only: the new daemon never
+/// READS these legacy paths, only deletes them.
 fn clean_stale_persisted_files(folder: &Path) {
-    let persisted_path = folder.join(".claude").join("clawborrator").join("session.json");
-    if persisted_path.exists() {
-        let _ = std::fs::remove_file(&persisted_path);
-    }
-    // Also nuke the legacy flat-file path earlier daemon builds wrote.
-    let legacy_sidecar = folder.join(".claude").join("clawborrator.session.json");
-    if legacy_sidecar.exists() {
-        let _ = std::fs::remove_file(&legacy_sidecar);
-    }
+    let clawborrator_dir = folder.join(".claude").join("clawborrator");
+    let identity_path = clawborrator_dir.join("identity.json");
+    if identity_path.exists() { let _ = std::fs::remove_file(&identity_path); }
+    let runtime_path = clawborrator_dir.join("runtime.json");
+    if runtime_path.exists() { let _ = std::fs::remove_file(&runtime_path); }
+    // Legacy paths from <0.2.4 daemons / <0.0.33 MCP — best-effort
+    // sweep on first restart after upgrade. Removable in a future
+    // version once nothing in the wild writes these names.
+    let legacy_identity = clawborrator_dir.join("session.json");
+    if legacy_identity.exists() { let _ = std::fs::remove_file(&legacy_identity); }
+    let legacy_runtime  = folder.join(".claude").join("clawborrator.session.json");
+    if legacy_runtime.exists()  { let _ = std::fs::remove_file(&legacy_runtime); }
 }
 
 /// Drop the persisted-session JSON the MCP reads on boot, plus a
@@ -365,7 +375,7 @@ fn write_persisted_session(
     if !gitignore.exists() {
         let _ = std::fs::write(&gitignore, "*\n");
     }
-    let sidecar_path = persisted_dir.join("session.json");
+    let sidecar_path = persisted_dir.join("identity.json");
     let sidecar_json = serde_json::json!({
         "sessionId":   session_id,
         "routingName": routing_name,
@@ -566,15 +576,19 @@ pub async fn destroy_session(mgr: &SessionManager, hub_url: &str, pat: &str, ses
             info!(dir = %scratch_dir.display(), "removed scratch dir");
         }
     }
-    // Wipe the per-folder persisted-session file so a future create
-    // in this same folder doesn't pick this dead session's id back
-    // up from MCP's loadPersistedSessionId() path. Also nuke the
-    // legacy flat-file location in case an old daemon build left
-    // one.
-    let persisted = folder.join(".claude").join("clawborrator").join("session.json");
-    if persisted.exists() { let _ = std::fs::remove_file(&persisted); }
-    let legacy_sidecar = folder.join(".claude").join("clawborrator.session.json");
-    if legacy_sidecar.exists() { let _ = std::fs::remove_file(&legacy_sidecar); }
+    // Wipe the per-folder persisted-session files so a future create
+    // in this same folder doesn't pick this dead session's id back up
+    // from MCP's loadPersistedSessionId() path. Also nukes the legacy
+    // <0.2.4 paths in case an older daemon/MCP build left them.
+    let clawborrator_dir = folder.join(".claude").join("clawborrator");
+    let identity = clawborrator_dir.join("identity.json");
+    if identity.exists() { let _ = std::fs::remove_file(&identity); }
+    let runtime  = clawborrator_dir.join("runtime.json");
+    if runtime.exists()  { let _ = std::fs::remove_file(&runtime); }
+    let legacy_identity = clawborrator_dir.join("session.json");
+    if legacy_identity.exists() { let _ = std::fs::remove_file(&legacy_identity); }
+    let legacy_runtime  = folder.join(".claude").join("clawborrator.session.json");
+    if legacy_runtime.exists()  { let _ = std::fs::remove_file(&legacy_runtime); }
     revoke_channel_token(hub_url, pat, channel_token_id).await;
     info!(session_id, channel_token_id, "session destroyed");
     Ok(())

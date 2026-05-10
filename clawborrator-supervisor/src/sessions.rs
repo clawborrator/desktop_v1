@@ -82,8 +82,9 @@ impl SessionManager {
     /// Return the session id of any currently-managed session
     /// whose folder matches `folder`. Used to refuse a second
     /// concurrent create in the same folder — two CC instances
-    /// sharing a sidecar file at .claude/clawborrator.session.json
-    /// race-write each other and produce undefined behavior.
+    /// sharing the .claude/clawborrator/ sidecars (identity.json /
+    /// runtime.json) race-write each other and produce undefined
+    /// behavior.
     pub fn find_by_folder(&self, folder: &std::path::Path) -> Option<String> {
         let map = self.inner.lock().unwrap();
         for (sid, entry) in map.iter() {
