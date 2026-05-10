@@ -50,7 +50,7 @@ use tracing::{error, info, warn};
 use url::Url;
 
 use crate::sessions::SessionManager;
-use crate::spawn::{create_session, destroy_session, input_session, kill_session, restart_session, screenshot_session, soft_restart_session, CreateArgs};
+use crate::spawn::{create_session, destroy_session, input_session, kill_session, restart_session, respawn_preserving_id_session, screenshot_session, soft_restart_session, sweep_orphan_scratch_dirs, CreateArgs};
 use crate::status::{TrayStatus, TrayStatusUpdater};
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -302,10 +302,28 @@ async fn run_session(ctx: &DaemonCtx, ws_url: &Url, cfg: &Config) -> Result<()> 
         machine_id:       &cfg.machine_id,
         daemon_version:   DAEMON_VERSION,
         hostname:         &host,
-        capabilities:     &["session.create", "session.kill", "session.destroy", "session.restart", "session.softrestart", "session.screenshot", "session.input"],
+        capabilities:     &["session.create", "session.kill", "session.destroy", "session.restart", "session.softrestart", "session.respawn_preserving_id", "session.screenshot", "session.input"],
         current_sessions: &current_sessions,
     };
     ws.send(Message::Text(serde_json::to_string(&hello)?)).await?;
+
+    // One-shot orphan-scratch sweep after the hub's autoStart-respawn
+    // batch should have completed. We spawn it 30s post-hello so:
+    //   - all preserve_session_id=true rows have their fresh scratch
+    //     dirs inserted into mgr (autoStart respawn fires from hub
+    //     immediately on hello_ack)
+    //   - any preserve_session_id=false rows are also in mgr (same
+    //     batch — they go through session.create which inserts
+    //     immediately)
+    // Anything still under ~/.clawborrator/sessions/ that's NOT in
+    // mgr's scratch_dir set is orphan from a prior daemon run.
+    {
+        let mgr = ctx.mgr.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            sweep_orphan_scratch_dirs(&mgr);
+        });
+    }
 
     let mut next_ping = Instant::now() + PING_INTERVAL;
 
@@ -506,6 +524,40 @@ async fn dispatch_session_softrestart(ctx: &DaemonCtx, args: serde_json::Value) 
     }
 }
 
+/// Args for session.respawn_preserving_id. Different from
+/// SessionRestartArgs because the daemon's mgr is empty post-reboot
+/// — we can't look up folder/routingName from in-memory state. Hub
+/// passes them in.
+#[derive(Deserialize)]
+struct SessionRespawnPreservingArgs {
+    #[serde(rename = "sessionId")]    session_id:   String,
+    folder:       String,
+    #[serde(default, rename = "routingName")] routing_name: Option<String>,
+    #[serde(default = "default_true", rename = "autoEnter")]
+    auto_enter:   bool,
+    #[serde(default, rename = "extraFlags")]
+    extra_flags:  Vec<String>,
+}
+
+/// Respawn-preserving-id: the autoStart-respawn entry point for
+/// sessions opted into preserveSessionId. Reads identity.json from
+/// the cwd, calls the hub's rotate-channel-token endpoint, mints a
+/// fresh scratch dir, spawns CC. SessionId stays the same; channel
+/// token rotates; old scratch dir orphans (cleaned by the startup
+/// sweep that runs after this finishes for all autoStart rows).
+async fn dispatch_session_respawn_preserving_id(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
+    let parsed: SessionRespawnPreservingArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
+    let folder = std::path::PathBuf::from(parsed.folder);
+    match respawn_preserving_id_session(
+        &ctx.mgr, &ctx.hub_url, &ctx.pat, &parsed.session_id,
+        folder, parsed.routing_name.as_deref(),
+        parsed.auto_enter, &parsed.extra_flags,
+    ).await {
+        Ok(sid) => Ok(serde_json::json!({ "sessionId": sid, "preserved": true })),
+        Err(e)  => Err(classify_dispatch_err("respawn_preserving_id_failed", e)),
+    }
+}
+
 fn dispatch_session_screenshot(ctx: &DaemonCtx, args: serde_json::Value) -> std::result::Result<serde_json::Value, (String, String)> {
     let parsed: SessionRefArgs = serde_json::from_value(args).map_err(|e| ("bad_args".into(), e.to_string()))?;
     match screenshot_session(&ctx.mgr, &parsed.session_id) {
@@ -548,8 +600,9 @@ where
         "session.create"     => dispatch_session_create(ctx, args).await,
         "session.kill"       => dispatch_session_kill(ctx, args),
         "session.destroy"    => dispatch_session_destroy(ctx, args).await,
-        "session.restart"     => dispatch_session_restart(ctx, args).await,
-        "session.softrestart" => dispatch_session_softrestart(ctx, args).await,
+        "session.restart"               => dispatch_session_restart(ctx, args).await,
+        "session.softrestart"           => dispatch_session_softrestart(ctx, args).await,
+        "session.respawn_preserving_id" => dispatch_session_respawn_preserving_id(ctx, args).await,
         "session.screenshot" => dispatch_session_screenshot(ctx, args),
         "session.input"      => dispatch_session_input(ctx, args),
         other                => Err(("unknown_op".into(), format!("unknown op: {other}"))),

@@ -129,6 +129,38 @@ async fn mint_channel_token(hub_url: &str, pat: &str, name: &str) -> Result<Mint
     Ok(resp.json::<MintTokenResponse>().await?)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateChannelTokenResponse {
+    channel_token:    String,
+    channel_token_id: i64,
+}
+
+/// Rotate the channel token for an existing managed session,
+/// preserving the sessionId. Used by `respawn_preserving_id_session`
+/// after a daemon restart / PC reboot — the old plaintext is gone
+/// from the daemon's memory, so we mint a fresh one for the new
+/// scratch dir while keeping the same sessionId on the hub side.
+/// Hub-side: revokes the old token row, mints a new one, UPDATEs
+/// sessions.channel_token_id atomically.
+async fn rotate_channel_token(hub_url: &str, pat: &str, session_id: &str) -> Result<RotateChannelTokenResponse> {
+    let url = format!(
+        "{}/api/v1/sessions/{}/rotate-channel-token",
+        hub_url.trim_end_matches('/'), session_id,
+    );
+    let client = reqwest::Client::builder()
+        .user_agent(format!("clawborrator-supervisor/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let resp = client.post(url).bearer_auth(pat).send().await
+        .context("POST /sessions/:id/rotate-channel-token")?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("rotate-channel-token failed: {s} {body}");
+    }
+    Ok(resp.json::<RotateChannelTokenResponse>().await?)
+}
+
 async fn revoke_channel_token(hub_url: &str, pat: &str, id: i64) {
     let url = format!("{}/api/v1/tokens/{}", hub_url.trim_end_matches('/'), id);
     let client = match reqwest::Client::builder().build() {
@@ -474,6 +506,115 @@ pub async fn create_session(mgr: &SessionManager, args: CreateArgs<'_>) -> Resul
         channel_token_id: pre.channel_token_id,
     });
     Ok(pre.session_id)
+}
+
+#[derive(Deserialize)]
+struct PersistedIdentity {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
+/// Read `<cwd>/.claude/clawborrator/identity.json` and return the
+/// persisted sessionId. Returns Err if the file is missing or
+/// unparseable — caller falls back to the impermanent path.
+fn read_persisted_identity(folder: &Path) -> Result<String> {
+    let path = folder.join(".claude").join("clawborrator").join("identity.json");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let parsed: PersistedIdentity = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {} as identity.json", path.display()))?;
+    Ok(parsed.session_id)
+}
+
+/// Respawn a managed session post-reboot WITHOUT rotating the
+/// sessionId. Path: read identity.json (must match the row's
+/// sessionId), call /api/v1/sessions/:id/rotate-channel-token to
+/// mint a fresh channel token (the old plaintext is gone from
+/// memory after the daemon restarted), prepare a new scratch dir +
+/// .mcp.json with the new token, spawn CC. The new MCP reads the
+/// SAME identity.json on boot and registers with the OLD sessionId
+/// + NEW channel token; the hub's UPSERT-on-register rebinds to
+/// the existing session row → history / agent.session_id / webhook
+/// pins all keep working.
+///
+/// Inserts into mgr keyed by the OLD sessionId. The OLD scratch
+/// dir on disk (from before the reboot) is orphaned; the daemon's
+/// startup sweep removes it after `runAutoStartRespawn` runs (once
+/// all live scratch dirs are known).
+pub async fn respawn_preserving_id_session(
+    mgr:          &SessionManager,
+    hub_url:      &str,
+    pat:          &str,
+    session_id:   &str,
+    folder:       PathBuf,
+    routing_name: Option<&str>,
+    auto_enter:   bool,
+    extra_flags:  &[String],
+) -> Result<String> {
+    let on_disk = read_persisted_identity(&folder)
+        .with_context(|| "respawn_preserving_id requires <cwd>/.claude/clawborrator/identity.json from a prior session")?;
+    if on_disk != session_id {
+        bail!(
+            "identity.json sessionId ({}) does not match expected ({}); refuse to respawn against a mismatched on-disk identity",
+            on_disk, session_id,
+        );
+    }
+
+    let rotated = rotate_channel_token(hub_url, pat, session_id).await
+        .context("rotating channel token")?;
+    info!(session_id, channel_token_id = rotated.channel_token_id, "rotated channel token for respawn");
+
+    let (scratch_dir, mcp_path) = prepare_mcp_config(hub_url, &rotated.channel_token)?;
+    let (master, child) = spawn_cc(&folder, &mcp_path, extra_flags)
+        .with_context(|| "spawning claude (respawn-preserving-id)")?;
+    let (parser, writer) = wire_pty_io(&*master)?;
+    if auto_enter {
+        info!("respawn AUTO START — pressing Enter for {AUTO_ENTER_DURATION_MS}ms");
+        spawn_auto_enter(writer.clone());
+    }
+
+    mgr.insert(session_id.to_string(), ManagedSession {
+        _session_id:      session_id.to_string(),
+        folder,
+        routing_name:     routing_name.map(|s| s.to_string()),
+        _master:          master,
+        _writer:          writer,
+        child,
+        parser,
+        scratch_dir,
+        channel_token_id: rotated.channel_token_id,
+    });
+    info!(session_id, "respawned with preserved sessionId");
+    Ok(session_id.to_string())
+}
+
+/// Best-effort sweep: walk `~/.clawborrator/sessions/` and remove
+/// any scratch dir not currently held by the SessionManager. Run
+/// once after `runAutoStartRespawn` completes — at that point every
+/// live session has a fresh scratch dir in mgr, so anything else is
+/// orphan from a prior daemon run.
+pub fn sweep_orphan_scratch_dirs(mgr: &SessionManager) {
+    let base = match dirs::home_dir() {
+        Some(h) => h.join(".clawborrator").join("sessions"),
+        None    => { warn!("no home dir; skipping orphan scratch sweep"); return; }
+    };
+    if !base.exists() { return; }
+    let live: std::collections::HashSet<PathBuf> = mgr.list_scratch_dirs().into_iter().collect();
+    let entries = match std::fs::read_dir(&base) {
+        Ok(e) => e,
+        Err(e) => { warn!(?e, dir = %base.display(), "could not read scratch base"); return; }
+    };
+    let mut swept = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() { continue; }
+        if live.contains(&path) { continue; }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => { info!(dir = %path.display(), "swept orphan scratch dir"); swept += 1; }
+            Err(e) => warn!(?e, dir = %path.display(), "failed to remove orphan scratch dir"),
+        }
+    }
+    info!(swept, base = %base.display(), "orphan-scratch sweep complete");
 }
 
 /// Soft-restart: SIGKILL the PTY child, then respawn CC against the

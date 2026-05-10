@@ -104,6 +104,21 @@ impl SessionManager {
     pub fn list_session_ids(&self) -> Vec<String> {
         self.inner.lock().unwrap().keys().cloned().collect()
     }
+
+    /// Snapshot of every live ManagedSession's scratch_dir. Used by
+    /// the orphan-scratch sweep at startup: anything under
+    /// `~/.clawborrator/sessions/` that's NOT in this set is leftover
+    /// from a prior daemon run and gets removed.
+    pub fn list_scratch_dirs(&self) -> Vec<std::path::PathBuf> {
+        let map = self.inner.lock().unwrap();
+        let mut out = Vec::with_capacity(map.len());
+        for entry in map.values() {
+            if let Ok(s) = entry.lock() {
+                out.push(s.scratch_dir.clone());
+            }
+        }
+        out
+    }
 }
 
 pub fn fresh_pty_size() -> PtySize {
