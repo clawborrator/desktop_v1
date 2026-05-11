@@ -20,7 +20,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use portable_pty::{Child, MasterPty, PtySize};
+use tokio::sync::mpsc;
 use vt100::Parser;
+
+use crate::parser_plugins::{PluginRegistry, watcher::{RestartRequest, WatcherHandle}};
 
 pub const PTY_ROWS: u16 = 40;
 pub const PTY_COLS: u16 = 120;
@@ -55,15 +58,37 @@ pub struct ManagedSession {
     pub parser:           Arc<Mutex<Parser>>,
     pub scratch_dir:      PathBuf,
     pub channel_token_id: i64,
+    /// Operator-supplied CLI flags forwarded to CC. Kept on the
+    /// session so the parser-plugin restart path (--resume /
+    /// --continue with no convo) can strip the offender and respawn.
+    pub extra_flags:      Vec<String>,
+    /// Whether the spawn opted into the auto-dismiss path. Forwarded
+    /// to soft_restart_session on plugin-driven respawn so the new
+    /// spawn keeps the same prompt-handling mode.
+    pub auto_enter:       bool,
+    /// Cancel handle for the per-session parser watcher. Dropped on
+    /// destroy / replaced on soft-restart.
+    pub watcher:          Option<WatcherHandle>,
 }
 
-#[derive(Default)]
 pub struct SessionManager {
-    inner: Mutex<HashMap<String, Arc<Mutex<ManagedSession>>>>,
+    inner:          Mutex<HashMap<String, Arc<Mutex<ManagedSession>>>>,
+    /// Shared plugin registry — same set of plugins fires against
+    /// every managed session's screen.
+    pub registry:   Arc<PluginRegistry>,
+    /// Channel handed to every watcher so a matched
+    /// RestartWithoutFlag plugin can request a respawn. The receiver
+    /// side lives in main.rs (handle_restart_requests).
+    pub restart_tx: mpsc::UnboundedSender<RestartRequest>,
 }
 
 impl SessionManager {
-    pub fn new() -> Self { Self::default() }
+    pub fn new(
+        registry:   Arc<PluginRegistry>,
+        restart_tx: mpsc::UnboundedSender<RestartRequest>,
+    ) -> Self {
+        Self { inner: Default::default(), registry, restart_tx }
+    }
 
     pub fn insert(&self, sid: String, sess: ManagedSession) {
         self.inner.lock().unwrap().insert(sid, Arc::new(Mutex::new(sess)));

@@ -33,11 +33,10 @@ use tokio::time::{sleep, Instant};
 use tracing::{info, warn};
 use vt100::Parser;
 
+use crate::parser_plugins::watcher::{spawn_watcher, WatcherHandle};
 use crate::sessions::{fresh_pty_size, ManagedSession, SessionManager, SharedWriter, PTY_COLS, PTY_ROWS};
 
 const SIDECAR_POLL_TIMEOUT_MS: u64 = 30_000;
-const AUTO_ENTER_DURATION_MS:  u64 = 5_000;
-const AUTO_ENTER_INTERVAL_MS:  u64 = 1_000;
 
 #[derive(Serialize)]
 struct MintTokenBody<'a> { name: &'a str }
@@ -277,29 +276,6 @@ fn spawn_pty_reader(mut reader: Box<dyn std::io::Read + Send>, parser: Arc<Mutex
     });
 }
 
-/// Hammer Enter into the PTY for AUTO_ENTER_DURATION_MS. Stopgap
-/// for CC's startup prompts until the categorized prompt-detector
-/// lands. Takes a SHARED writer (Arc<Mutex<...>>) — owning it
-/// would close CC's stdin when the task ends, which exits CC.
-/// See ManagedSession for the lifecycle commentary.
-#[allow(dead_code)]
-fn spawn_auto_enter(writer: SharedWriter) {
-    tokio::spawn(async move {
-        let deadline = Instant::now() + Duration::from_millis(AUTO_ENTER_DURATION_MS);
-        while Instant::now() < deadline {
-            {
-                let mut w = match writer.lock() {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                if w.write_all(b"\r").is_err() { break; }
-                let _ = w.flush();
-            }
-            sleep(Duration::from_millis(AUTO_ENTER_INTERVAL_MS)).await;
-        }
-    });
-}
-
 #[allow(dead_code)]
 async fn poll_sidecar(folder: &PathBuf) -> Result<String> {
     let sidecar = folder.join(".claude").join("clawborrator").join("runtime.json");
@@ -456,6 +432,25 @@ fn wire_pty_io(
     Ok((parser, writer))
 }
 
+/// Spawn the per-session parser-plugin watcher and return the handle
+/// (so the session can cancel it on destroy / replace it on
+/// soft-restart). The registry + restart channel come from the
+/// SessionManager — every session shares the same plugin set.
+fn spawn_session_watcher(
+    mgr:        &SessionManager,
+    session_id: &str,
+    parser:     Arc<Mutex<Parser>>,
+    writer:     SharedWriter,
+) -> WatcherHandle {
+    spawn_watcher(
+        session_id.to_string(),
+        parser,
+        writer,
+        mgr.registry.clone(),
+        Some(mgr.restart_tx.clone()),
+    )
+}
+
 pub async fn create_session(mgr: &SessionManager, args: CreateArgs<'_>) -> Result<String> {
     precheck_create(mgr, &args)?;
     clean_stale_persisted_files(&args.folder);
@@ -480,19 +475,19 @@ pub async fn create_session(mgr: &SessionManager, args: CreateArgs<'_>) -> Resul
         .context("spawning claude")?;
 
     let (parser, writer) = wire_pty_io(&*master)?;
-    if args.auto_enter {
-        // AUTO START: daemon presses Enter ~5x at 1s intervals to
-        // dismiss CC's default-yes startup prompts (Trust folder,
-        // Load MCP, Load dev channels). Fast path; assumes operator
-        // wants the defaults.
-        info!("AUTO START — pressing Enter for {AUTO_ENTER_DURATION_MS}ms to dismiss startup prompts");
-        spawn_auto_enter(writer.clone());
+    // Parser-plugin watcher handles known startup prompts (Trust
+    // folder, dev channels, MCP, bypass-permissions) AND signals a
+    // respawn when --resume / --continue land in a dead-end state.
+    // Replaces the older 5s AUTO_ENTER blind pump.
+    let watcher = if args.auto_enter {
+        info!(session_id = %pre.session_id,
+              "AUTO START — parser-plugin watcher will dismiss known prompts");
+        Some(spawn_session_watcher(mgr, &pre.session_id, parser.clone(), writer.clone()))
     } else {
-        // MANUAL START: operator drives the prompts via the screenshot
-        // PIP keystroke capture or `claw session input`. Required when
-        // a non-default answer is needed.
-        info!("MANUAL START — operator will drive startup prompts via screenshot PIP / claw session input");
-    }
+        info!(session_id = %pre.session_id,
+              "MANUAL START — operator drives prompts; no watcher attached");
+        None
+    };
 
     mgr.insert(pre.session_id.clone(), ManagedSession {
         _session_id:      pre.session_id.clone(),
@@ -504,6 +499,9 @@ pub async fn create_session(mgr: &SessionManager, args: CreateArgs<'_>) -> Resul
         parser,
         scratch_dir,
         channel_token_id: pre.channel_token_id,
+        extra_flags:      args.extra_flags.to_vec(),
+        auto_enter:       args.auto_enter,
+        watcher,
     });
     Ok(pre.session_id)
 }
@@ -568,10 +566,12 @@ pub async fn respawn_preserving_id_session(
     let (master, child) = spawn_cc(&folder, &mcp_path, extra_flags)
         .with_context(|| "spawning claude (respawn-preserving-id)")?;
     let (parser, writer) = wire_pty_io(&*master)?;
-    if auto_enter {
-        info!("respawn AUTO START — pressing Enter for {AUTO_ENTER_DURATION_MS}ms");
-        spawn_auto_enter(writer.clone());
-    }
+    let watcher = if auto_enter {
+        info!(session_id, "respawn AUTO START — attaching parser-plugin watcher");
+        Some(spawn_session_watcher(mgr, session_id, parser.clone(), writer.clone()))
+    } else {
+        None
+    };
 
     mgr.insert(session_id.to_string(), ManagedSession {
         _session_id:      session_id.to_string(),
@@ -583,6 +583,9 @@ pub async fn respawn_preserving_id_session(
         parser,
         scratch_dir,
         channel_token_id: rotated.channel_token_id,
+        extra_flags:      extra_flags.to_vec(),
+        auto_enter,
+        watcher,
     });
     info!(session_id, "respawned with preserved sessionId");
     Ok(session_id.to_string())
@@ -649,12 +652,16 @@ pub async fn soft_restart_session(
         (s.folder.clone(), s.scratch_dir.clone())
     };
 
-    // Kill the old child. Non-blocking on portable-pty; the OS will
-    // reap. Logging-only on error — the new spawn proceeds either way.
+    // Kill the old child + cancel the old parser-plugin watcher.
+    // Non-blocking; the watcher task observes the cancel via its
+    // oneshot and exits cleanly. Logging-only on errors.
     {
         let mut s = entry.lock().unwrap();
         if let Err(e) = s.child.kill() {
             warn!(?e, session_id, "failed to kill old child during soft-restart; continuing");
+        }
+        if let Some(w) = s.watcher.as_mut() {
+            w.cancel();
         }
     }
 
@@ -662,20 +669,27 @@ pub async fn soft_restart_session(
     let (master, child) = spawn_cc(&folder, &mcp_path, extra_flags)
         .with_context(|| "spawning claude (soft-restart)")?;
     let (parser, writer) = wire_pty_io(&*master)?;
-    if auto_enter {
-        info!("soft-restart AUTO START — pressing Enter for {AUTO_ENTER_DURATION_MS}ms");
-        spawn_auto_enter(writer.clone());
-    }
+    let new_watcher = if auto_enter {
+        info!(session_id, "soft-restart — attaching fresh parser-plugin watcher");
+        Some(spawn_session_watcher(mgr, session_id, parser.clone(), writer.clone()))
+    } else {
+        None
+    };
 
-    // Swap new PTY/child/reader/writer into the existing entry.
-    // _session_id, folder, routing_name, scratch_dir, channel_token_id
-    // all stay the same — that's the whole point of soft-restart.
+    // Swap new PTY/child/reader/writer + flags + watcher into the
+    // existing entry. _session_id, folder, routing_name, scratch_dir,
+    // channel_token_id stay the same — that's the whole point of
+    // soft-restart. extra_flags + auto_enter get refreshed so a
+    // plugin-driven restart that stripped a flag persists in mgr.
     {
         let mut s = entry.lock().unwrap();
-        s._master = master;
-        s.child   = child;
-        s.parser  = parser;
-        s._writer = writer;
+        s._master     = master;
+        s.child       = child;
+        s.parser      = parser;
+        s._writer     = writer;
+        s.extra_flags = extra_flags.to_vec();
+        s.auto_enter  = auto_enter;
+        s.watcher     = new_watcher;
     }
     info!(session_id, "soft-restarted CC (sessionId preserved)");
     Ok(())
@@ -686,6 +700,7 @@ pub fn kill_session(mgr: &SessionManager, session_id: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("no managed session with id {session_id}"))?;
     let mut s = entry.lock().unwrap();
     s.child.kill().map_err(|e| anyhow!("kill: {e}"))?;
+    if let Some(w) = s.watcher.as_mut() { w.cancel(); }
     info!(session_id, "killed CC process");
     Ok(())
 }
@@ -772,6 +787,7 @@ pub async fn destroy_session(mgr: &SessionManager, hub_url: &str, pat: &str, ses
         // best-effort kill; child may already be dead from a prior
         // session.kill or natural exit. Don't propagate the error.
         let _ = s.child.kill();
+        if let Some(w) = s.watcher.as_mut() { w.cancel(); }
         (s.scratch_dir.clone(), s.channel_token_id, s.folder.clone())
     };
     if scratch_dir.exists() {

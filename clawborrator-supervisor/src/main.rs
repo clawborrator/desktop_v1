@@ -29,6 +29,7 @@ mod auth;
 mod autostart;
 mod logging;
 mod oauth;
+mod parser_plugins;
 mod sessions;
 mod spawn;
 mod status;
@@ -762,11 +763,19 @@ pub(crate) async fn run_daemon(cli: Cli, tray: TrayStatusUpdater) -> Result<()> 
     let token = resolve_token(&cli, &cfg)?;
     let ws_url = ws_url_for_supervisor(&cli.hub_url)?;
 
+    // Parser-plugin wiring: registry is shared across every session,
+    // restart channel feeds RestartWithoutFlag matches (e.g. --resume
+    // / --continue dead-end detection) into a respawn handler.
+    let registry = Arc::new(crate::parser_plugins::PluginRegistry::with_defaults());
+    let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mgr = Arc::new(SessionManager::new(registry, restart_tx));
+    tokio::spawn(handle_restart_requests(mgr.clone(), restart_rx));
+
     let ctx = DaemonCtx {
         hub_url:    cli.hub_url.clone(),
         pat:        token,
         machine_id: cfg.machine_id.clone(),
-        mgr:        Arc::new(SessionManager::new()),
+        mgr,
         tray,
     };
 
@@ -777,6 +786,48 @@ pub(crate) async fn run_daemon(cli: Cli, tray: TrayStatusUpdater) -> Result<()> 
             Ok(())
         }
     }
+}
+
+/// Consume RestartWithoutFlag events emitted by parser plugins
+/// (--resume / --continue dead-ends). For each, snapshot the current
+/// session's flags, strip the offending flag, and soft-restart so
+/// the new CC spawn picks up the corrected argv. The session row +
+/// channel token + scratch dir all survive — sessionId is preserved.
+async fn handle_restart_requests(
+    mgr: Arc<SessionManager>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::parser_plugins::watcher::RestartRequest>,
+) {
+    while let Some(req) = rx.recv().await {
+        if let Err(e) = restart_without_flag(&mgr, &req).await {
+            warn!(session_id = %req.session_id, flag = %req.flag_to_strip,
+                  err = %e, "restart-without-flag failed");
+        }
+    }
+}
+
+async fn restart_without_flag(
+    mgr: &SessionManager,
+    req: &crate::parser_plugins::watcher::RestartRequest,
+) -> Result<()> {
+    let entry = mgr.get(&req.session_id)?;
+    let (auto_enter, new_flags) = {
+        let s = entry.lock().unwrap();
+        let new: Vec<String> = s.extra_flags.iter()
+            .filter(|f| !matches_flag(f, &req.flag_to_strip))
+            .cloned()
+            .collect();
+        (s.auto_enter, new)
+    };
+    info!(session_id = %req.session_id, stripped = %req.flag_to_strip,
+          remaining_flags = ?new_flags, "restart-without-flag: respawning");
+    soft_restart_session(mgr, &req.session_id, auto_enter, &new_flags).await
+}
+
+/// True when `flag` is exactly `target` OR a `--target=…` form. CC
+/// accepts both `--resume X` and `--resume=X`; the watcher just
+/// knows the bare flag name.
+fn matches_flag(flag: &str, target: &str) -> bool {
+    flag == target || flag.starts_with(&format!("{target}="))
 }
 
 fn main() -> Result<()> {
