@@ -35,6 +35,12 @@ use super::{Action, PluginRegistry, ScreenView};
 use crate::sessions::SharedWriter;
 
 const POLL_INTERVAL_MS: u64 = 250;
+// After this many ticks (~12s at 250ms) with no plugin fired and a
+// stable non-empty screen, dump the screen contents to logs once.
+// Diagnostic for "CC stuck at prompt; no plugin matched" reports —
+// the next time it happens, the screen text is in the supervisor
+// log and we can author / loosen a plugin to cover it.
+const STUCK_LOG_AFTER_TICKS: u32 = 48;
 
 #[derive(Debug, Clone)]
 pub struct RestartRequest {
@@ -71,6 +77,8 @@ pub fn spawn_watcher(
     tokio::spawn(async move {
         let mut fired: HashSet<&'static str> = HashSet::new();
         let mut last_text = String::new();
+        let mut stable_ticks: u32 = 0;
+        let mut stuck_logged = false;
         info!(session_id = %sid_for_task, plugins = registry.plugins().len(),
               "parser watcher started");
 
@@ -89,8 +97,27 @@ pub fn spawn_watcher(
             };
 
             // Skip plugin dispatch when the screen is unchanged since
-            // the last tick — cheap optimization for an idle CC.
-            if snapshot.text == last_text { continue; }
+            // the last tick — cheap optimization for an idle CC. The
+            // stable-ticks counter tracks how many consecutive polls
+            // produced the same screen so we can spot a "stuck"
+            // state (CC parked at a prompt no plugin recognized).
+            if snapshot.text == last_text {
+                if !snapshot.text.trim().is_empty() {
+                    stable_ticks = stable_ticks.saturating_add(1);
+                    if !stuck_logged && fired.is_empty()
+                        && stable_ticks == STUCK_LOG_AFTER_TICKS {
+                        warn!(session_id = %sid_for_task,
+                              ticks = stable_ticks,
+                              cursor = ?snapshot.cursor,
+                              "watcher idle: no plugin matched and screen stable; dumping contents (one-shot)\n---SCREEN---\n{}\n---END---",
+                              snapshot.text);
+                        stuck_logged = true;
+                    }
+                }
+                continue;
+            }
+            stable_ticks = 0;
+            stuck_logged = false;
             last_text = snapshot.text.clone();
 
             for plugin in registry.plugins() {
