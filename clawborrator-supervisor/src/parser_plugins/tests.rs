@@ -103,8 +103,16 @@ fn assert_matches_enter(plugin: &dyn ParserPlugin, text: &str) {
 fn assert_matches_down_enter(plugin: &dyn ParserPlugin, text: &str) {
     let s = screen(text);
     match plugin.inspect(&s) {
-        Some(Action::WriteBytes(b)) => assert_eq!(b, b"\x1b[B\r"),
-        other => panic!("{} did not return ↓+Enter for fixture; got {:?}", plugin.name(), other),
+        Some(Action::WriteSequence(chunks)) => {
+            // Expect: SS3 B (app-cursor arrow-down) first, then
+            // Enter after a delay > 0. The watcher dispatches each
+            // chunk with its `delay_ms` before-write.
+            assert_eq!(chunks.len(), 2, "expected 2-chunk sequence (↓ then Enter)");
+            assert_eq!(chunks[0].1, b"\x1bOB", "first chunk should be SS3 B (app-cursor ↓)");
+            assert!(chunks[1].0 > 0, "second chunk should have a delay so Ink re-renders before Enter");
+            assert_eq!(chunks[1].1, b"\r", "second chunk should be Enter");
+        }
+        other => panic!("{} did not return ↓+Enter sequence; got {:?}", plugin.name(), other),
     }
 }
 

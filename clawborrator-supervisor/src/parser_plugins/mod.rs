@@ -94,15 +94,22 @@ fn strip_cursor_marker(s: &str) -> Option<&str> {
 }
 
 /// What a plugin asks the watcher to do when it matches.
-/// `WriteBytes` is the common case — most CC prompts are
-/// dismissed by writing one Enter (or arrow-down + Enter for the
-/// Bypass-Permissions case). `RestartWithoutFlag` signals that the
-/// current spawn was passed a flag that put CC into a dead-end
-/// state (e.g. `--continue` with no resumable conversation); the
-/// session must be killed and respawned without it.
+/// `WriteBytes` is the common case — one Enter dismisses most CC
+/// prompts. `WriteSequence` is for multi-step input where the
+/// chunks must NOT be bundled in a single PTY write (e.g.
+/// arrow-down + Enter on the Bypass-Permissions prompt; Ink's
+/// keypress parser needs to see the screen re-render between
+/// navigation and confirm or it eats the Enter). Each tuple is
+/// `(delay_ms_before_write, bytes)` — the delay applies BEFORE
+/// the corresponding write, so the first chunk's delay is usually
+/// 0. `RestartWithoutFlag` signals that the current spawn was
+/// passed a flag that put CC into a dead-end state (e.g.
+/// `--continue` with no resumable conversation); the session
+/// must be killed and respawned without it.
 #[derive(Debug, Clone)]
 pub enum Action {
     WriteBytes(Vec<u8>),
+    WriteSequence(Vec<(u64, Vec<u8>)>),
     RestartWithoutFlag(String),
 }
 

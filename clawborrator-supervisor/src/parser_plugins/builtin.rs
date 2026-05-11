@@ -124,7 +124,19 @@ impl ParserPlugin for McpServer {
 
 /// `--dangerously-skip-permissions` warning. CC defaults the highlight
 /// to option 1 ("No, exit") to make the dangerous path explicit. We
-/// want option 2 ("Yes, I accept"), so send arrow-down + Enter.
+/// want option 2 ("Yes, I accept"), so navigate down and confirm.
+///
+/// Byte sequence: SS3 B (`\x1bOB`) is the application-cursor-mode
+/// arrow-down — CC's Ink TUI sets DECCKM (`\x1b[?1h`) on boot, so
+/// the normal-mode CSI B (`\x1b[B`) is silently discarded.
+///
+/// Why WriteSequence with a delay: Ink's keypress parser needs the
+/// render cycle between arrow-down (highlight moves) and Enter
+/// (confirm) to commit the new selection. Bundling both bytes
+/// into one PTY write made CC eat the Enter on option 1's
+/// already-rendered state, leaving the prompt visible. 150ms is
+/// generous — Ink typically re-renders within one event-loop turn
+/// (<16ms) but cold-boot CC under load can lag.
 pub struct BypassPermissions;
 impl ParserPlugin for BypassPermissions {
     fn name(&self) -> &'static str { "bypass-permissions" }
@@ -132,9 +144,11 @@ impl ParserPlugin for BypassPermissions {
         if !screen.contains("WARNING: Claude Code running in Bypass Permissions mode") { return None; }
         if !screen.contains("Yes, I accept") { return None; }
         let (_, opt) = screen.highlighted_option()?;
-        // Cursor defaults to option 1; we want option 2 → ↓ + Enter.
         if opt == 1 {
-            Some(Action::WriteBytes(b"\x1b[B\r".to_vec()))
+            Some(Action::WriteSequence(vec![
+                (0,   b"\x1bOB".to_vec()),  // SS3 B — app-cursor-mode arrow-down
+                (150, b"\r".to_vec()),       // Enter, after Ink re-renders
+            ]))
         } else { None }
     }
 }

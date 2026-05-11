@@ -145,6 +145,46 @@ pub fn spawn_watcher(
                             }
                         }
                     }
+                    Action::WriteSequence(chunks) => {
+                        let total: usize = chunks.iter().map(|(_, b)| b.len()).sum();
+                        info!(session_id = %sid_for_task, plugin = name,
+                              chunk_count = chunks.len(), total_bytes = total,
+                              "plugin matched → writing sequence");
+                        // Spawn a side-task so the watcher loop can
+                        // keep polling while the sequence's inter-
+                        // chunk delays elapse. The shared writer is
+                        // safe to hold across the awaits — only the
+                        // brief lock-write-flush window holds the
+                        // mutex.
+                        let writer_clone = writer.clone();
+                        let sid_for_seq = sid_for_task.clone();
+                        let chunks_clone = chunks.clone();
+                        let plugin_name = name;
+                        tokio::spawn(async move {
+                            for (delay_ms, bytes) in chunks_clone {
+                                if delay_ms > 0 {
+                                    sleep(Duration::from_millis(delay_ms)).await;
+                                }
+                                match writer_clone.lock() {
+                                    Ok(mut w) => {
+                                        if let Err(e) = w.write_all(&bytes) {
+                                            warn!(session_id = %sid_for_seq,
+                                                  plugin = plugin_name, ?e,
+                                                  "sequence chunk write failed");
+                                            return;
+                                        }
+                                        let _ = w.flush();
+                                    }
+                                    Err(_) => {
+                                        warn!(session_id = %sid_for_seq,
+                                              plugin = plugin_name,
+                                              "writer mutex poisoned mid-sequence");
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
                     Action::RestartWithoutFlag(flag) => {
                         info!(session_id = %sid_for_task, plugin = name, flag = %flag,
                               "plugin matched → requesting restart-without-flag");
