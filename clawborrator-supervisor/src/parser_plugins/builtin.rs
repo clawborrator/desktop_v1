@@ -24,6 +24,7 @@ pub fn default_plugins() -> Vec<Box<dyn ParserPlugin>> {
         Box::new(NoResume),
         Box::new(NoContinue),
         Box::new(ResumePicker),
+        Box::new(ResumeSummary),
         Box::new(TrustFolder),
         Box::new(DevChannels),
         Box::new(McpServer),
@@ -73,6 +74,26 @@ impl ParserPlugin for ResumePicker {
         // `has_cursor_highlight` which accepts either `>` or `❯`.
         if !screen.has_cursor_highlight() { return None; }
         Some(Action::WriteBytes(b"\r".to_vec()))
+    }
+}
+
+/// `--resume` / `--continue` against a long-lived session triggers
+/// the "resume from summary?" prompt before the regular picker.
+/// Default highlight is option 1 ("Resume from summary (recommended)")
+/// which is the safer, cheaper path. We confirm with Enter.
+///
+/// Sentinel pair keeps this from false-matching: the leading-line
+/// "This session is … old and … tokens" framing is unique to this
+/// prompt and won't appear in the freeform picker or in a started
+/// session.
+pub struct ResumeSummary;
+impl ParserPlugin for ResumeSummary {
+    fn name(&self) -> &'static str { "resume-summary" }
+    fn inspect(&self, screen: &ScreenView) -> Option<Action> {
+        if !screen.contains("Resume from summary") { return None; }
+        if !screen.contains("Resume full session as-is") { return None; }
+        let (_, opt) = screen.highlighted_option()?;
+        if opt == 1 { Some(Action::WriteBytes(b"\r".to_vec())) } else { None }
     }
 }
 

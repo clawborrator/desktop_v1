@@ -88,6 +88,26 @@ const RESUME_PICKER: &str = "Resume session
     Ctrl+A to show all projects · Ctrl+B to only show current branch · Space to preview · Ctrl+R to rename · Type to
     search · Esc to cancel";
 
+const RESUME_SUMMARY: &str = "This session is 1h 34m old and 290.3k tokens.
+
+  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.
+
+  > 1. Resume from summary (recommended)
+    2. Resume full session as-is
+    3. Don't ask me again
+
+  Enter to confirm · Esc to cancel";
+
+const RESUME_SUMMARY_LIVE: &str = "This session is 1h 34m old and 290.3k tokens.
+
+  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.
+
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is
+    3. Don't ask me again
+
+  Enter to confirm · Esc to cancel";
+
 const UNRELATED: &str = "claude > some unrelated screen content without prompts";
 
 // === Helpers ===
@@ -199,6 +219,27 @@ fn assert_no_match(plugin: &dyn ParserPlugin, text: &str) {
     assert_no_match(&ResumePicker, &stripped);
 }
 
+// === ResumeSummary ===
+
+#[test] fn resume_summary_fires() { assert_matches_enter(&ResumeSummary, RESUME_SUMMARY); }
+#[test] fn resume_summary_fires_with_heavy_angle_marker() {
+    assert_matches_enter(&ResumeSummary, RESUME_SUMMARY_LIVE);
+}
+#[test] fn resume_summary_ignores_resume_picker() { assert_no_match(&ResumeSummary, RESUME_PICKER); }
+#[test] fn resume_summary_ignores_no_resume() { assert_no_match(&ResumeSummary, NO_RESUME); }
+#[test] fn resume_summary_ignores_trust() { assert_no_match(&ResumeSummary, TRUST_FOLDER); }
+#[test] fn resume_summary_ignores_unrelated() { assert_no_match(&ResumeSummary, UNRELATED); }
+#[test] fn resume_summary_skips_when_cursor_already_on_full_resume() {
+    // Operator manually moved cursor to option 2 — don't press
+    // Enter on a non-default selection that has a different
+    // billing impact.
+    let text = RESUME_SUMMARY.replace("> 1. Resume from summary",
+                                      "  1. Resume from summary")
+                              .replace("2. Resume full session",
+                                       "> 2. Resume full session");
+    assert_no_match(&ResumeSummary, &text);
+}
+
 // === Cross-plugin isolation: only the right plugin fires per fixture ===
 
 #[test] fn each_fixture_matches_exactly_one_plugin() {
@@ -211,6 +252,7 @@ fn assert_no_match(plugin: &dyn ParserPlugin, text: &str) {
         ("no-resume",          NO_RESUME),
         ("no-continue",        NO_CONTINUE),
         ("resume-picker",      RESUME_PICKER),
+        ("resume-summary",     RESUME_SUMMARY),
     ];
     for (expected, text) in cases {
         let s = screen(text);
