@@ -38,18 +38,25 @@ impl ScreenView {
         Self { text, cursor, lines }
     }
 
-    /// First line whose trimmed-left content starts with `>`. This is
-    /// the cursor-highlighted option in CC's interactive prompts
-    /// ("> 1. Yes, I trust this folder"). Returns the line's index
-    /// and the option number parsed off it (1, 2, 3…). Returns None
-    /// if the screen doesn't contain such a marker line.
+    /// First line whose trimmed-left content starts with a cursor
+    /// marker (ASCII `>` or U+276F `❯`). This is the
+    /// cursor-highlighted option in CC's interactive prompts
+    /// ("❯ 1. Yes, I trust this folder"). Returns the line's index
+    /// and the option number parsed off it (1, 2, 3…). Returns
+    /// None if the screen doesn't contain such a marker line.
+    ///
+    /// Both markers are supported because CC's TUI has shipped
+    /// builds using each — `>` historically, `❯` (heavy
+    /// right-pointing angle quotation) in current releases. Plugin
+    /// matching MUST tolerate both or it silently breaks across CC
+    /// upgrades.
     pub fn highlighted_option(&self) -> Option<(usize, u32)> {
         for (idx, line) in self.lines.iter().enumerate() {
             let trimmed = line.trim_start();
-            if !trimmed.starts_with('>') { continue; }
-            // Parse the digit after the `>`. Format: "> 1. Yes…"
-            // (possibly with extra whitespace).
-            let rest = trimmed[1..].trim_start();
+            let rest = match strip_cursor_marker(trimmed) {
+                Some(r) => r.trim_start(),
+                None    => continue,
+            };
             let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(n) = digits.parse::<u32>() {
                 return Some((idx, n));
@@ -58,9 +65,32 @@ impl ScreenView {
         None
     }
 
+    /// True if any line on the screen has a cursor-marker prefix
+    /// (`>` or `❯`) followed by content. Used by plugins where the
+    /// highlighted item isn't a numbered option (e.g. the
+    /// `--resume` picker, where the selection is a freeform
+    /// session title).
+    pub fn has_cursor_highlight(&self) -> bool {
+        self.lines.iter().any(|l| {
+            let t = l.trim_start();
+            match strip_cursor_marker(t) {
+                Some(rest) => !rest.trim_start().is_empty(),
+                None       => false,
+            }
+        })
+    }
+
     pub fn contains(&self, needle: &str) -> bool {
         self.text.contains(needle)
     }
+}
+
+/// Returns the slice after the cursor-marker prefix (`>` or `❯`),
+/// or None if the input doesn't start with either marker. Pulled
+/// out so plugins + `highlighted_option` share one source of truth
+/// for marker recognition.
+fn strip_cursor_marker(s: &str) -> Option<&str> {
+    s.strip_prefix('>').or_else(|| s.strip_prefix('❯'))
 }
 
 /// What a plugin asks the watcher to do when it matches.

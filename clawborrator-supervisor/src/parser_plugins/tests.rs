@@ -229,3 +229,66 @@ fn assert_no_match(plugin: &dyn ParserPlugin, text: &str) {
     let s = screen("    1. Foo\n    2. Bar\n");
     assert_eq!(s.highlighted_option(), None);
 }
+#[test] fn highlighted_option_accepts_heavy_angle_marker() {
+    // Current CC builds use ❯ (U+276F) instead of `>`. Plugins
+    // must match both — regression captured 2026-05-11 from a
+    // live stuck-at-dev-channels screen.
+    let s = screen("  ❯ 1. Foo\n    2. Bar\n");
+    assert_eq!(s.highlighted_option(), Some((0, 1)));
+}
+#[test] fn highlighted_option_accepts_heavy_angle_option_2() {
+    let s = screen("    1. Foo\n  ❯ 2. Bar\n");
+    assert_eq!(s.highlighted_option(), Some((1, 2)));
+}
+
+#[test] fn has_cursor_highlight_matches_both_markers() {
+    assert!(screen("  > asdf").has_cursor_highlight());
+    assert!(screen("  ❯ asdf").has_cursor_highlight());
+    assert!(!screen("    asdf").has_cursor_highlight());
+    assert!(!screen("  > ").has_cursor_highlight());     // empty after marker
+    assert!(!screen("  ❯ ").has_cursor_highlight());     // empty after marker
+}
+
+// === Live-CC fixtures (heavy-angle ❯ marker) ===
+
+const DEV_CHANNELS_LIVE: &str = "  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development only. Do not use this option to run
+  channels you have downloaded off the internet.
+
+  Please use --channels to run a list of approved channels.
+
+  Channels: server:clawborrator
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm · Esc to cancel";
+
+#[test] fn dev_channels_fires_with_heavy_angle_marker() {
+    // Verbatim screen captured from a stuck v0.2.10 watcher — the
+    // bug that motivated this regression test.
+    assert_matches_enter(&DevChannels, DEV_CHANNELS_LIVE);
+}
+
+#[test] fn trust_folder_fires_with_heavy_angle_marker() {
+    let text = TRUST_FOLDER.replace("> 1. Yes, I trust this folder",
+                                    "❯ 1. Yes, I trust this folder");
+    assert_matches_enter(&TrustFolder, &text);
+}
+
+#[test] fn mcp_fires_with_heavy_angle_marker() {
+    let text = MCP_SERVER.replace("> 1. Use this and all future MCP servers",
+                                  "❯ 1. Use this and all future MCP servers");
+    assert_matches_enter(&McpServer, &text);
+}
+
+#[test] fn bypass_fires_with_heavy_angle_marker() {
+    let text = BYPASS_PERMISSIONS.replace("> 1. No, exit", "❯ 1. No, exit");
+    assert_matches_down_enter(&BypassPermissions, &text);
+}
+
+#[test] fn resume_picker_fires_with_heavy_angle_marker() {
+    let text = RESUME_PICKER.replace("> asdf", "❯ asdf");
+    assert_matches_enter(&ResumePicker, &text);
+}

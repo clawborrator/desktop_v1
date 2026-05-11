@@ -68,11 +68,10 @@ impl ParserPlugin for ResumePicker {
     fn inspect(&self, screen: &ScreenView) -> Option<Action> {
         if !screen.contains("Resume session") { return None; }
         if !screen.contains("Ctrl+A to show all projects") { return None; }
-        // Cursor marker `> ` indicates the highlighted session;
-        // require it before firing so we don't poke an
-        // empty/loading picker.
-        let has_highlight = screen.lines.iter().any(|l| l.trim_start().starts_with("> "));
-        if !has_highlight { return None; }
+        // Require a cursor highlight on a non-empty line before
+        // firing so we don't poke an empty/loading picker. Uses
+        // `has_cursor_highlight` which accepts either `>` or `❯`.
+        if !screen.has_cursor_highlight() { return None; }
         Some(Action::WriteBytes(b"\r".to_vec()))
     }
 }
