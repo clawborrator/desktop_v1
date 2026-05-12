@@ -108,6 +108,31 @@ const RESUME_SUMMARY_LIVE: &str = "This session is 1h 34m old and 290.3k tokens.
 
   Enter to confirm · Esc to cancel";
 
+// In-session AskUserQuestion tool prompt — looks like a startup
+// prompt (numbered options with `>` cursor on option 1) but is
+// triggered mid-session, not at boot. We must NOT auto-dismiss
+// these. Differentiated by the `Enter to select · ↑/↓ to navigate`
+// footer (startup prompts say `Enter to confirm · Esc to cancel`)
+// and by question-specific text that won't match any built-in
+// plugin's sentinel pair. Captured 2026-05-12 from fileId=100.
+const ASK_USER_QUESTION: &str = "□ Beverage
+
+Which type of beverage do you prefer?
+
+> 1. Coffee
+     Bold, caffeinated, ideal for mornings.
+  2. Tea
+     Lighter caffeine, wide variety of flavors.
+  3. Water
+     Plain and hydrating.
+  4. Soda
+     Sweet and fizzy.
+  5. Type something.
+
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel";
+
 const UNRELATED: &str = "claude > some unrelated screen content without prompts";
 
 // === Helpers ===
@@ -263,6 +288,26 @@ fn assert_no_match(plugin: &dyn ParserPlugin, text: &str) {
         assert_eq!(matches, vec![*expected],
                    "expected only `{}` to match its fixture, got {:?}", expected, matches);
     }
+}
+
+// === No-plugin-fires defense: AskUserQuestion in-session prompt ===
+
+#[test] fn no_builtin_plugin_fires_on_ask_user_question() {
+    // In-session AskUserQuestion tool calls render a startup-shaped
+    // prompt (`> 1. Foo` cursor + numbered options) but must NEVER
+    // be auto-dismissed — the operator is being asked something
+    // and the supervisor stepping in would corrupt the conversation.
+    // Every built-in plugin must guard with a sentinel pair tight
+    // enough to ignore this fixture. Regression captured from
+    // fileId=100 on 2026-05-12.
+    let s = screen(ASK_USER_QUESTION);
+    let plugins = super::builtin::default_plugins();
+    let matches: Vec<&'static str> = plugins.iter()
+        .filter(|p| p.inspect(&s).is_some())
+        .map(|p| p.name())
+        .collect();
+    assert!(matches.is_empty(),
+            "AskUserQuestion prompt false-matched plugin(s): {:?}", matches);
 }
 
 // === ScreenView::highlighted_option parser ===
