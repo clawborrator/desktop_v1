@@ -837,31 +837,108 @@ pub fn screenshot_session(mgr: &SessionManager, session_id: &str) -> Result<serd
     let screen = parser.screen();
     let (rows, cols) = screen.size();
     let (cur_row, cur_col) = screen.cursor_position();
-    // Explicit cell-by-cell render. screen.contents() trims runs
-    // of trailing-empty cells from each row, which collapses
-    // box-drawing layouts (CC's startup banner uses two boxes
-    // side-by-side at columns 0 and ~80; trimming the gap
-    // squishes the right box's columns onto the leftmost
-    // column's row). Padding every row to `cols` characters
-    // preserves the layout exactly as vt100 sees it.
-    let mut text = String::with_capacity((rows as usize + 1) * (cols as usize + 2));
+    // Walk every cell collecting text + ANSI attributes. Adjacent
+    // cells with identical (fg, bg, bold, italic, underline, inverse)
+    // collapse into one styled run, so a typical CC frame ends up
+    // ~20 runs × 24 rows on the wire (vs. cols×rows individual cells).
+    //
+    // Padding every row to `cols` cells with a default-styled space
+    // for None / empty preserves the layout exactly as vt100 sees it.
+    // Trimming trailing whitespace was tempting but it collapses
+    // box-drawing layouts that draw two columns of boxes side-by-side
+    // (CC's startup banner).
+    let mut lines: Vec<serde_json::Value> = Vec::with_capacity(rows as usize);
     for r in 0..rows {
+        let mut row_runs: Vec<serde_json::Value> = Vec::new();
+        let mut cur_style: Option<SpanStyle> = None;
+        let mut cur_text = String::new();
         for c in 0..cols {
-            match screen.cell(r, c) {
+            let (ch, style) = match screen.cell(r, c) {
                 Some(cell) => {
-                    let s = cell.contents();
-                    if s.is_empty() { text.push(' '); }
-                    else { text.push_str(&s); }
+                    let glyph = cell.contents();
+                    let g = if glyph.is_empty() { " ".to_string() } else { glyph };
+                    (g, SpanStyle::from_cell(cell))
                 }
-                None => text.push(' '),
+                None => (" ".to_string(), SpanStyle::default()),
+            };
+            match &cur_style {
+                Some(prev) if *prev == style => {
+                    cur_text.push_str(&ch);
+                }
+                _ => {
+                    if let Some(prev) = cur_style.take() {
+                        if !cur_text.is_empty() {
+                            row_runs.push(prev.to_json(std::mem::take(&mut cur_text)));
+                        }
+                    }
+                    cur_style = Some(style);
+                    cur_text = ch;
+                }
             }
         }
-        text.push('\n');
+        if let Some(prev) = cur_style.take() {
+            if !cur_text.is_empty() {
+                row_runs.push(prev.to_json(cur_text));
+            }
+        }
+        lines.push(serde_json::Value::Array(row_runs));
     }
     Ok(serde_json::json!({
         "rows":   rows,
         "cols":   cols,
-        "text":   text,
+        "lines":  lines,
         "cursor": { "row": cur_row, "col": cur_col },
     }))
+}
+
+// Per-cell visual attributes captured off the vt100 parser. Equality
+// on this struct drives the per-row run-length encoding: cells with
+// identical attrs collapse into one styled span on the wire.
+#[derive(Default, PartialEq, Clone)]
+struct SpanStyle {
+    fg: Option<serde_json::Value>,
+    bg: Option<serde_json::Value>,
+    b: bool, i: bool, u: bool, inv: bool,
+}
+
+impl SpanStyle {
+    fn from_cell(cell: &vt100::Cell) -> Self {
+        SpanStyle {
+            fg: color_to_json(cell.fgcolor()),
+            bg: color_to_json(cell.bgcolor()),
+            b:   cell.bold(),
+            i:   cell.italic(),
+            u:   cell.underline(),
+            inv: cell.inverse(),
+        }
+    }
+
+    // Build the on-wire object. Attribute flags + colors are omitted
+    // when unset so a default-styled span is just `{"t": "..."}`.
+    fn to_json(&self, text: String) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        m.insert("t".into(), serde_json::Value::String(text));
+        if let Some(fg) = &self.fg { m.insert("fg".into(), fg.clone()); }
+        if let Some(bg) = &self.bg { m.insert("bg".into(), bg.clone()); }
+        if self.b   { m.insert("b".into(),   true.into()); }
+        if self.i   { m.insert("i".into(),   true.into()); }
+        if self.u   { m.insert("u".into(),   true.into()); }
+        if self.inv { m.insert("inv".into(), true.into()); }
+        serde_json::Value::Object(m)
+    }
+}
+
+// Map vt100's Color enum to a wire-friendly JSON value:
+//   Default → None (field omitted entirely)
+//   Idx(n)  → number 0..255 (the standard ANSI palette index)
+//   Rgb(..) → [r, g, b] (24-bit truecolor)
+// Renderers map Idx 0..15 against a fixed dark-theme palette of their
+// choosing; 16..231 follows the standard 6×6×6 color cube; 232..255
+// is the standard greyscale ramp. RGB passes through unchanged.
+fn color_to_json(c: vt100::Color) -> Option<serde_json::Value> {
+    match c {
+        vt100::Color::Default     => None,
+        vt100::Color::Idx(n)      => Some(serde_json::Value::from(n)),
+        vt100::Color::Rgb(r, g, b) => Some(serde_json::json!([r, g, b])),
+    }
 }
