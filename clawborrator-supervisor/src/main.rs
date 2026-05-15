@@ -65,10 +65,19 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 #[derive(Parser, Debug)]
 #[command(author, version, about = "clawborrator desktop supervisor daemon")]
 pub(crate) struct Cli {
-    /// Hub base URL. Defaults to https://next.clawborrator.com or
-    /// the CLAWBORRATOR_HUB_URL env var.
-    #[arg(long, env = "CLAWBORRATOR_HUB_URL", default_value = DEFAULT_HUB_URL)]
-    hub_url: String,
+    /// Hub base URL. Resolution order (first match wins):
+    ///   1. --hub-url <url>            (this flag)
+    ///   2. CLAWBORRATOR_HUB_URL env var
+    ///   3. cfg.hub_url cached at last successful `login`
+    ///   4. https://next.clawborrator.com (built-in default)
+    ///
+    /// Once `login` succeeds against a given URL, that URL is cached
+    /// in ~/.clawborrator/desktop_v1.json. The Task-Scheduler entry
+    /// installed by `install-task` runs the binary with no arguments
+    /// at logon, so multi-hub operators rely on this cache rather
+    /// than baking the URL into the autostart command line.
+    #[arg(long, env = "CLAWBORRATOR_HUB_URL")]
+    hub_url: Option<String>,
 
     /// Bearer token (`cw_pat_*` or `cw_app_*`). Read from
     /// CLAWBORRATOR_PAT env var if not provided. OAuth-driven mint
@@ -144,7 +153,7 @@ fn config_path() -> Result<PathBuf> {
 /// Load or generate the per-install config. First run mints a fresh
 /// uuid for `machine_id` and writes the file with no token (the
 /// OAuth flow fills that in later). Subsequent runs reuse both.
-fn load_or_init_config() -> Result<Config> {
+pub(crate) fn load_or_init_config() -> Result<Config> {
     let path = config_path()?;
     if path.exists() {
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path:?}"))?;
@@ -642,6 +651,16 @@ async fn run_with_reconnect(ctx: DaemonCtx, ws_url: Url, cfg: Config) -> Result<
 /// No implicit OAuth fallback — the daemon can be launched from a
 /// non-interactive context (Task Scheduler at logon, with no console
 /// or browser available), where opening a browser would silently fail.
+/// Resolve the effective hub URL via the documented precedence:
+/// CLI flag → CLAWBORRATOR_HUB_URL env → cfg.hub_url cache → built-in default.
+/// Clap collapses the first two into `cli.hub_url`; this helper handles the
+/// remaining two so the daemon honors a cached hub when no flag/env is set.
+pub(crate) fn effective_hub_url(cli: &Cli, cfg: &Config) -> String {
+    if let Some(s) = cli.hub_url.as_deref() { return s.to_string(); }
+    if let Some(s) = cfg.hub_url.as_deref() { return s.to_string(); }
+    DEFAULT_HUB_URL.to_string()
+}
+
 /// Use the `login` subcommand to mint a token interactively.
 fn resolve_token(cli: &Cli, cfg: &Config) -> Result<String> {
     if let Some(t) = &cli.pat {
@@ -650,10 +669,11 @@ fn resolve_token(cli: &Cli, cfg: &Config) -> Result<String> {
     let cached = cfg.token.as_deref().ok_or_else(|| anyhow!(
         "no cached app token — run `clawborrator-supervisor login` first to authenticate"
     ))?;
-    if cfg.hub_url.as_deref() != Some(cli.hub_url.as_str()) {
+    let hub = effective_hub_url(cli, cfg);
+    if cfg.hub_url.as_deref() != Some(hub.as_str()) {
         return Err(anyhow!(
-            "cached token was minted against {:?}, not {} — run `clawborrator-supervisor login` against the new hub",
-            cfg.hub_url, cli.hub_url,
+            "cached token was minted against {:?}, not {hub} — run `clawborrator-supervisor login` against the new hub",
+            cfg.hub_url,
         ));
     }
     Ok(cached.to_string())
@@ -688,15 +708,16 @@ async fn run_subcommand(cli: &Cli, cmd: Command) -> Result<()> {
 
 async fn cmd_login(cli: &Cli, force: bool) -> Result<()> {
     let mut cfg = load_or_init_config()?;
-    match auth::login(&mut cfg, &cli.hub_url, force).await? {
+    let hub = effective_hub_url(cli, &cfg);
+    match auth::login(&mut cfg, &hub, force).await? {
         auth::LoginOutcome::AlreadyLoggedIn { login } => {
-            eprintln!("Already logged in as {} at {}.", login, cli.hub_url);
+            eprintln!("Already logged in as {login} at {hub}.");
             eprintln!("Pass --force to re-authenticate.");
         }
         auth::LoginOutcome::Authenticated { login } => {
             save_config(&cfg)?;
             match login {
-                Some(l) => eprintln!("Logged in as {} at {}.", l, cli.hub_url),
+                Some(l) => eprintln!("Logged in as {l} at {hub}."),
                 None    => eprintln!("Logged in (couldn't confirm identity via /api/v1/me)."),
             }
             eprintln!("Run `install-task` next if you want the daemon to launch at logon.");
@@ -707,7 +728,8 @@ async fn cmd_login(cli: &Cli, force: bool) -> Result<()> {
 
 async fn cmd_logout(cli: &Cli) -> Result<()> {
     let mut cfg = load_or_init_config()?;
-    match auth::logout(&mut cfg, &cli.hub_url).await {
+    let hub = effective_hub_url(cli, &cfg);
+    match auth::logout(&mut cfg, &hub).await {
         auth::LogoutOutcome::Revoked         => eprintln!("Hub revoked the token."),
         auth::LogoutOutcome::NoCachedToken   => eprintln!("No cached token; nothing to revoke server-side."),
         auth::LogoutOutcome::RevokeFailed(e) => warn!(?e, "hub /auth/logout failed; clearing local cache anyway"),
@@ -758,10 +780,11 @@ fn task_status(provider: &dyn autostart::AutostartProvider) -> Result<()> {
 pub(crate) async fn run_daemon(cli: Cli, tray: TrayStatusUpdater) -> Result<()> {
     let mut cfg = load_or_init_config()?;
     if let Some(forced) = cli.machine_id.clone() { cfg.machine_id = forced; }
-    info!(machine_id = %cfg.machine_id, daemon = DAEMON_VERSION, "starting");
+    let hub = effective_hub_url(&cli, &cfg);
+    info!(machine_id = %cfg.machine_id, hub = %hub, daemon = DAEMON_VERSION, "starting");
 
     let token = resolve_token(&cli, &cfg)?;
-    let ws_url = ws_url_for_supervisor(&cli.hub_url)?;
+    let ws_url = ws_url_for_supervisor(&hub)?;
 
     // Parser-plugin wiring: registry is shared across every session,
     // restart channel feeds RestartWithoutFlag matches (e.g. --resume
@@ -772,7 +795,7 @@ pub(crate) async fn run_daemon(cli: Cli, tray: TrayStatusUpdater) -> Result<()> 
     tokio::spawn(handle_restart_requests(mgr.clone(), restart_rx));
 
     let ctx = DaemonCtx {
-        hub_url:    cli.hub_url.clone(),
+        hub_url:    hub.clone(),
         pat:        token,
         machine_id: cfg.machine_id.clone(),
         mgr,

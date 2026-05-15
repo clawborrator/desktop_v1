@@ -82,7 +82,12 @@ pub fn run_with_tray(cli: Cli, log_path: PathBuf) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (status_updater, status_rx) = TrayStatusUpdater::channel();
-    let hub_url = cli.hub_url.clone();
+    // Resolve the effective hub URL for the "Open dashboard" tray
+    // entry. Mirrors the same precedence used at daemon-start so the
+    // menu link tracks whatever hub this daemon is actually connected
+    // to (flag/env > cfg cache > built-in default).
+    let cfg_for_dash = crate::load_or_init_config().context("loading config for tray dashboard URL")?;
+    let hub_url = crate::effective_hub_url(&cli, &cfg_for_dash);
 
     // Capture the main thread id BEFORE spawning workers so the
     // daemon thread can post WM_QUIT here when it exits (e.g. no
