@@ -15,7 +15,8 @@ sessions on it. Pre-built Windows binary on
 | Screenshot + input forwarding | shipped |
 | Windows: per-user Task Scheduler autostart | shipped (v0.1.0) |
 | Windows: system-tray icon + graceful Quit | shipped (v0.2.0) |
-| macOS / Linux autostart | stubbed — install fails with NotYetImplemented |
+| Linux: systemd user-service autostart (headless) | shipped |
+| macOS autostart | stubbed; install fails with NotYetImplemented |
 | Push events (`desktop.health` etc) | open |
 
 ## Quick start (Windows)
@@ -77,18 +78,76 @@ launches it without a console flash. Subcommands invoked from
 PowerShell still print to the parent shell via
 `AttachConsole(ATTACH_PARENT_PROCESS)`.
 
-## macOS / Linux
+## Quick start (Linux)
 
-The daemon path runs from source today — `cargo run -p
-clawborrator-supervisor` works on macOS / Linux. The autostart
-subcommands (`install-task` etc.) return `NotYetImplemented`; run the
-binary manually until the per-OS autostart impls land (launchd
-LaunchAgent on macOS; systemd-user / XDG autostart on Linux).
+Linux runs the daemon **headless** as a **systemd user service**. No
+tray icon, no GUI. Tested against systemd distros (Debian / Ubuntu /
+Fedora / Arch / openSUSE); non-systemd distros (Alpine / Void /
+Gentoo musl) work via `cargo run` but the `install-task` subcommand
+will fail.
+
+1. Download the latest
+   [`clawborrator-supervisor-linux-x64`](https://github.com/clawborrator/desktop_v1/releases/latest)
+   from GitHub Releases, or `cargo build --release -p
+   clawborrator-supervisor` from source.
+
+2. Sign in:
+   ```sh
+   ./clawborrator-supervisor login
+   ```
+   Opens your browser, authenticates via GitHub OAuth + PKCE,
+   caches a `cw_app_…` Bearer token at
+   `$HOME/.clawborrator/desktop_v1.json`.
+
+3. Register the systemd user service. No root needed:
+   ```sh
+   ./clawborrator-supervisor install-task
+   ```
+   Writes `~/.config/systemd/user/clawborrator-supervisor.service`,
+   runs `systemctl --user daemon-reload`, and enables the unit.
+
+4. To make the service start at machine boot (before any user
+   login) and survive logouts, enable linger ONCE on this machine:
+   ```sh
+   sudo loginctl enable-linger "$USER"
+   ```
+   Without linger, the service starts when you next log in
+   (graphical or SSH) and stops on logout.
+
+5. Start it now without waiting for boot:
+   ```sh
+   systemctl --user start clawborrator-supervisor
+   ```
+
+6. Watch the logs live:
+   ```sh
+   journalctl --user -u clawborrator-supervisor -f
+   ```
+
+7. Open https://next.clawborrator.com/orchard/, click `+ Session`,
+   pick a folder, and the daemon spawns a managed Claude Code
+   session that you and any collaborators you share with can drive
+   in real time.
+
+To uninstall:
+```sh
+./clawborrator-supervisor uninstall-task
+```
+Disables the unit, stops it, removes the unit file, runs
+`daemon-reload`. Linger is left untouched. Revert linger with
+`sudo loginctl disable-linger "$USER"` if you also want that.
+
+## macOS
+
+Stubbed. `install-task` returns `NotYetImplemented`. The daemon
+itself runs from source:
 
 ```sh
 cargo run -p clawborrator-supervisor -- login
 cargo run -p clawborrator-supervisor
 ```
+
+launchd LaunchAgent integration lands when a macOS user needs it.
 
 ## Architecture (Windows daemon path)
 
