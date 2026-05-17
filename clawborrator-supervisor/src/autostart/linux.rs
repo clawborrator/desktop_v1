@@ -170,10 +170,44 @@ fn render_unit(exe: &Path) -> String {
     )
 }
 
+// Read this process's effective UID by parsing /proc/self/status.
+// Linux-only, no new dep. Used to synthesize XDG_RUNTIME_DIR when
+// the parent shell didn't populate it (common after a fresh SSH
+// login on minimal server installs whose PAM stack doesn't include
+// pam_systemd, or when linger was enabled in this shell but env
+// hasn't been refreshed).
+fn current_uid() -> Option<u32> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:\t") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
 fn run_systemctl_user(args: &[&str]) -> Result<std::process::Output> {
-    let out = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("--user").args(args);
+
+    // If XDG_RUNTIME_DIR isn't already set in the parent env,
+    // synthesize /run/user/<uid> and pass it to the child. This
+    // covers the case where the operator's SSH session didn't
+    // trigger pam_systemd (some server installs don't ship it in
+    // the SSH PAM chain) OR they just enabled linger and haven't
+    // re-logged in yet. systemctl --user uses XDG_RUNTIME_DIR to
+    // locate the user manager's bus socket; without it, libdbus
+    // fails with "No medium found".
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        if let Some(uid) = current_uid() {
+            let dir = format!("/run/user/{uid}");
+            if std::path::Path::new(&dir).exists() {
+                cmd.env("XDG_RUNTIME_DIR", &dir);
+            }
+        }
+    }
+
+    let out = cmd
         .output()
         .context("could not exec systemctl --user (is systemd present on this system?)")?;
     if !out.status.success() {
