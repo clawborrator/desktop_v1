@@ -91,28 +91,37 @@ will fail.
    from GitHub Releases, or `cargo build --release -p
    clawborrator-supervisor` from source.
 
-2. Sign in:
+2. **(Server installs only — once per machine)** Enable linger so
+   your user systemd manager runs before login. Skipping this on a
+   fresh SSH-only box means `install-task` will fail at
+   `daemon-reload` with "No medium found" because the user manager
+   isn't running yet:
+   ```sh
+   sudo loginctl enable-linger "$USER"
+   ```
+   Then re-login over SSH (or `export
+   XDG_RUNTIME_DIR=/run/user/$(id -u)` for the current shell only).
+   Desktop installs can usually skip this since a graphical login
+   has already started the user manager.
+
+3. Sign in. Default uses **OAuth device flow** — works on any host,
+   no browser needed locally, you approve from any phone/laptop:
    ```sh
    ./clawborrator-supervisor login
    ```
-   Opens your browser, authenticates via GitHub OAuth + PKCE,
-   caches a `cw_app_…` Bearer token at
-   `$HOME/.clawborrator/desktop_v1.json`.
+   Prints a verification URL + short code. Open on any device,
+   enter the code, approve on GitHub. The daemon's poller picks up
+   the token + caches it at `$HOME/.clawborrator/desktop_v1.json`.
 
-3. Register the systemd user service. No root needed:
+   Desktop users with a local browser can opt into the legacy
+   browser-callback flow with `login --browser` instead.
+
+4. Register the systemd user service. No root needed:
    ```sh
    ./clawborrator-supervisor install-task
    ```
    Writes `~/.config/systemd/user/clawborrator-supervisor.service`,
-   runs `systemctl --user daemon-reload`, and enables the unit.
-
-4. To make the service start at machine boot (before any user
-   login) and survive logouts, enable linger ONCE on this machine:
-   ```sh
-   sudo loginctl enable-linger "$USER"
-   ```
-   Without linger, the service starts when you next log in
-   (graphical or SSH) and stops on logout.
+   runs `systemctl --user daemon-reload`, enables the unit.
 
 5. Start it now without waiting for boot:
    ```sh

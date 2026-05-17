@@ -62,15 +62,18 @@ impl AutostartProvider for LinuxAutostart {
 
         eprintln!("Installed {UNIT_NAME} into {}", unit_path.display());
         eprintln!();
-        eprintln!("To make the service start at machine boot (before you log in):");
-        eprintln!("    sudo loginctl enable-linger \"$USER\"");
-        eprintln!("Without linger, the service starts at your next graphical / SSH login");
-        eprintln!("and stops when you log out.");
-        eprintln!();
-        eprintln!("To start it right now:");
+        eprintln!("To start it now:");
         eprintln!("    systemctl --user start {UNIT_NAME}");
+        eprintln!();
         eprintln!("To watch its logs live:");
         eprintln!("    journalctl --user -u {UNIT_NAME} -f");
+        eprintln!();
+        eprintln!("If you haven't already enabled linger for boot-time start (before any");
+        eprintln!("user login + survives logouts):");
+        eprintln!("    sudo loginctl enable-linger \"$USER\"");
+        eprintln!("(Linger needs to run before `install-task` on a fresh server install,");
+        eprintln!(" otherwise the user systemd manager isn't running and daemon-reload");
+        eprintln!(" fails with \"No medium found\". Re-login over SSH after enable-linger.)");
         Ok(())
     }
 
@@ -177,11 +180,44 @@ fn run_systemctl_user(args: &[&str]) -> Result<std::process::Output> {
         // Surface stderr in the error chain; the caller decides whether
         // to treat non-zero as a hard fail or a soft "already absent".
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr_trim = stderr.trim();
+
+        // "No medium found" is libdbus speak for "the user systemd
+        // manager isn't running for this UID, so there's no bus
+        // socket to connect to". Standard symptom over fresh SSH
+        // on a server install — PAM didn't trigger pam_systemd to
+        // start the user manager because no graphical login has
+        // happened. Fix is `sudo loginctl enable-linger $USER` then
+        // re-login (or export XDG_RUNTIME_DIR for the current shell).
+        // Detect by stderr content and emit the actionable hint
+        // instead of the cryptic systemd-internal message.
+        if stderr_trim.contains("No medium found") || stderr_trim.contains("Failed to connect to bus") {
+            bail!(
+                "systemctl --user {} can't connect to a user systemd manager.\n\
+                 \n\
+                 Your user systemd manager isn't running yet (common on a fresh SSH session\n\
+                 to a server install). To start it:\n\
+                 \n\
+                     sudo loginctl enable-linger \"$USER\"\n\
+                 \n\
+                 Then either re-login over SSH (cleanest) OR export the runtime dir for\n\
+                 the current shell:\n\
+                 \n\
+                     export XDG_RUNTIME_DIR=/run/user/$(id -u)\n\
+                 \n\
+                 Then re-run `clawborrator-supervisor install-task`.\n\
+                 \n\
+                 (Raw systemctl error: {})",
+                args.join(" "),
+                stderr_trim
+            );
+        }
+
         bail!(
             "systemctl --user {} exited with code {:?}: {}",
             args.join(" "),
             out.status.code(),
-            stderr.trim()
+            stderr_trim
         );
     }
     Ok(out)
