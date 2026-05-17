@@ -130,6 +130,15 @@ enum Command {
     UninstallTask,
     /// Show whether the autostart entry is currently registered.
     TaskStatus,
+    /// Check the host for the supervisor's runtime prerequisites:
+    /// the `claude` CLI on PATH (Claude Code), and `npm`/`npx` on
+    /// PATH (used by Claude Code to launch the clawborrator-mcp
+    /// server). Reports each as found / missing + the install command
+    /// to fix. Exits 0 if everything is present, 1 otherwise.
+    /// Useful to run BEFORE creating your first session so you find
+    /// out about missing tools without having to interpret the
+    /// `502: spawning claude` error from orchard.
+    PrereqCheck,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -712,7 +721,78 @@ async fn run_subcommand(cli: &Cli, cmd: Command) -> Result<()> {
         Command::InstallTask     => install_task(provider),
         Command::UninstallTask   => uninstall_task(provider),
         Command::TaskStatus      => task_status(provider),
+        Command::PrereqCheck     => prereq_check(),
     }
+}
+
+fn prereq_check() -> Result<()> {
+    // Search PATH for each tool. On Linux we ALSO check $HOME/.local/bin
+    // explicitly since that's where the official Claude installer drops
+    // the binary, and where ad-hoc npm installs land for users that
+    // configure `prefix=~/.local`. spawn_cc + the install-task unit
+    // template both prepend ~/.local/bin to PATH, so a prereq-check
+    // that fails to find tools there would falsely report missing.
+    let mut missing = Vec::new();
+    let mut found = Vec::new();
+    for (name, install_hint) in [
+        ("claude", "curl -fsSL https://claude.ai/install.sh | bash"),
+        ("npx",    "sudo apt install -y nodejs npm   # or dnf on fedora/rhel"),
+        ("npm",    "sudo apt install -y nodejs npm"),
+        ("node",   "sudo apt install -y nodejs"),
+    ] {
+        if let Some(path) = find_on_path(name) {
+            found.push((name, path));
+        } else {
+            missing.push((name, install_hint));
+        }
+    }
+    eprintln!("Runtime prerequisite check:");
+    eprintln!();
+    for (name, path) in &found {
+        eprintln!("  [ok]      {name:<8}  {}", path.display());
+    }
+    for (name, hint) in &missing {
+        eprintln!("  [missing] {name:<8}  install: {hint}");
+    }
+    eprintln!();
+    if missing.is_empty() {
+        eprintln!("All prereqs present. Session creation through orchard should work.");
+        Ok(())
+    } else {
+        eprintln!("{} missing prereq(s). Install them, then re-run this check.", missing.len());
+        eprintln!("(If you install npm-global tools to ~/.npm-global/bin/, also add that path to the supervisor's systemd unit Environment= line, OR install via sudo so they land in /usr/local/bin/.)");
+        std::process::exit(1);
+    }
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    // Build the search list: $PATH entries, plus ~/.local/bin on
+    // Linux/macOS as a fallback (some installers drop binaries there
+    // even when ~/.local/bin isn't in PATH).
+    let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME") {
+        let local_bin = PathBuf::from(home).join(".local").join("bin");
+        if !paths.iter().any(|p| p == &local_bin) {
+            paths.push(local_bin);
+        }
+    }
+    // Try the bare name, plus .exe on Windows.
+    let candidates: Vec<String> = if cfg!(target_os = "windows") {
+        vec![format!("{name}.exe"), format!("{name}.cmd"), name.to_string()]
+    } else {
+        vec![name.to_string()]
+    };
+    for dir in &paths {
+        for cand in &candidates {
+            let full = dir.join(cand);
+            if full.is_file() {
+                return Some(full);
+            }
+        }
+    }
+    None
 }
 
 async fn cmd_login(cli: &Cli, force: bool, browser: bool) -> Result<()> {

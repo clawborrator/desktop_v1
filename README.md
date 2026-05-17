@@ -86,6 +86,32 @@ Fedora / Arch / openSUSE); non-systemd distros (Alpine / Void /
 Gentoo musl) work via `cargo run` but the `install-task` subcommand
 will fail.
 
+### Prerequisites
+
+The supervisor binary itself is self-contained, but it SPAWNS Claude
+Code under a PTY for each session, and that Claude Code instance
+launches the `clawborrator-mcp` server via `npx`. So the Linux host
+needs:
+
+```sh
+# Claude Code CLI (official installer; drops binary at ~/.local/bin/claude)
+curl -fsSL https://claude.ai/install.sh | bash
+claude setup-token        # one-time auth
+
+# Node.js + npm + npx (for the clawborrator-mcp server CC launches)
+sudo apt install -y nodejs npm     # Debian / Ubuntu
+# OR
+sudo dnf install -y nodejs npm     # Fedora / RHEL
+```
+
+Verify both are on PATH:
+```sh
+which claude npx
+```
+Both should print paths. Without them, session-create will fail with
+`502: spawning claude` (claude missing) or the MCP server will fail to
+start mid-session (npm/npx missing).
+
 1. Download the latest
    [`clawborrator-supervisor-linux-x64`](https://github.com/clawborrator/desktop_v1/releases/latest)
    from GitHub Releases, or `cargo build --release -p
