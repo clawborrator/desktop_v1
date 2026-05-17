@@ -107,6 +107,15 @@ enum Command {
         /// Re-authenticate even if a valid token is already cached.
         #[arg(long)]
         force: bool,
+        /// Use the browser-callback OAuth flow (legacy) instead of
+        /// the device-authorization flow. Only useful on a desktop
+        /// host with a working browser AND a callback port that the
+        /// browser can reach on loopback (127.0.0.1:<random>).
+        /// Headless installs (Linux servers via SSH, dev VMs) should
+        /// leave this off so the default device flow runs — the
+        /// operator approves from any browser on any device.
+        #[arg(long)]
+        browser: bool,
     },
     /// Revoke the cached app token server-side (best-effort) and
     /// clear it from the local config. The machine_id is preserved
@@ -698,7 +707,7 @@ fn attach_parent_console_if_any() {}
 async fn run_subcommand(cli: &Cli, cmd: Command) -> Result<()> {
     let provider = autostart::current();
     match cmd {
-        Command::Login { force } => cmd_login(cli, force).await,
+        Command::Login { force, browser } => cmd_login(cli, force, browser).await,
         Command::Logout          => cmd_logout(cli).await,
         Command::InstallTask     => install_task(provider),
         Command::UninstallTask   => uninstall_task(provider),
@@ -706,10 +715,11 @@ async fn run_subcommand(cli: &Cli, cmd: Command) -> Result<()> {
     }
 }
 
-async fn cmd_login(cli: &Cli, force: bool) -> Result<()> {
+async fn cmd_login(cli: &Cli, force: bool, browser: bool) -> Result<()> {
     let mut cfg = load_or_init_config()?;
     let hub = effective_hub_url(cli, &cfg);
-    match auth::login(&mut cfg, &hub, force).await? {
+    let flow = if browser { auth::LoginFlow::Browser } else { auth::LoginFlow::Device };
+    match auth::login(&mut cfg, &hub, force, flow).await? {
         auth::LoginOutcome::AlreadyLoggedIn { login } => {
             eprintln!("Already logged in as {login} at {hub}.");
             eprintln!("Pass --force to re-authenticate.");

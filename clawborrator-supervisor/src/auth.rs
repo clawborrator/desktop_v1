@@ -37,7 +37,15 @@ pub enum LoginOutcome {
 /// Caller is responsible for `save_config(&cfg)` after the
 /// `Authenticated` branch (and choosing not to after `AlreadyLoggedIn`,
 /// since nothing changed).
-pub async fn login(cfg: &mut Config, hub_url: &str, force: bool) -> Result<LoginOutcome> {
+/// OAuth flow selector. `Device` is the default — works everywhere
+/// (no browser required, no callback listener, the operator can
+/// approve from a phone). `Browser` opts back into the
+/// /127.0.0.1-callback flow for desktop users with a local browser
+/// who prefer the auto-open + auto-close-tab experience.
+#[derive(Debug, Clone, Copy)]
+pub enum LoginFlow { Device, Browser }
+
+pub async fn login(cfg: &mut Config, hub_url: &str, force: bool, flow: LoginFlow) -> Result<LoginOutcome> {
     if !force && token_matches_hub(cfg, hub_url) {
         let cached = cfg.token.as_deref().expect("token_matches_hub guarantees Some");
         if let Ok(login) = fetch_user_login(hub_url, cached).await {
@@ -45,8 +53,10 @@ pub async fn login(cfg: &mut Config, hub_url: &str, force: bool) -> Result<Login
         }
         // Cached token rejected by the hub — fall through to re-auth.
     }
-    let token = oauth::run_oauth_flow(hub_url, &cfg.machine_id).await
-        .with_context(|| "OAuth login failed")?;
+    let token = match flow {
+        LoginFlow::Device  => oauth::run_device_flow(hub_url, &cfg.machine_id).await,
+        LoginFlow::Browser => oauth::run_oauth_flow(hub_url, &cfg.machine_id).await,
+    }.with_context(|| "OAuth login failed")?;
     cfg.token   = Some(token.clone());
     cfg.hub_url = Some(hub_url.to_string());
     let login = fetch_user_login(hub_url, &token).await.ok();

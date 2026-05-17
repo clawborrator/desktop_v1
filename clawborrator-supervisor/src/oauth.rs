@@ -126,12 +126,160 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
     }
 }
 
-/// Run the OAuth flow. Returns the minted `cw_app_…` token.
+// ─── Device Authorization Grant (RFC 8628) ───────────────────────
+//
+// Used by default for headless installs (no browser, no callback
+// listener). The supervisor:
+//   1. POSTs /api/v1/auth/device/code with machine_id + app_name
+//   2. Prints the user_code + verification_uri prominently
+//   3. Polls /api/v1/auth/device/token at the returned interval until
+//      the row flips to 'approved' and the response carries an
+//      access_token.
+
+#[derive(Deserialize, Debug)]
+struct DeviceCodeResp {
+    device_code:               String,
+    user_code:                  String,
+    verification_uri:           String,
+    verification_uri_complete:  String,
+    expires_in:                 u64,
+    interval:                   u64,
+}
+
+#[derive(Serialize, Debug)]
+struct DeviceCodeBody<'a> {
+    app_name:   &'a str,
+    machine_id: &'a str,
+}
+
+#[derive(Serialize, Debug)]
+struct DevicePollBody<'a> {
+    device_code: &'a str,
+}
+
+#[derive(Deserialize, Debug)]
+struct DevicePollSuccess {
+    access_token: String,
+    #[allow(dead_code)]
+    token_type:   String,
+}
+
+#[derive(Deserialize, Debug)]
+struct DevicePollError {
+    error: String,
+}
+
+/// Run the OAuth 2.0 Device Authorization Grant flow. Returns the
+/// minted `cw_app_…` token once the user completes the verification.
+///
+/// Works on any host with outbound HTTPS to the hub — no browser
+/// required, no callback listener bound, no SSH tunnels needed.
+/// The user can authorize from a phone, laptop, or any device with
+/// a browser.
+pub async fn run_device_flow(hub_url: &str, machine_id: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent(format!("{APP_NAME}/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    // Step 1: mint a device_code + user_code.
+    let code_url = Url::parse(hub_url)?.join("/api/v1/auth/device/code")?;
+    let code_resp = client.post(code_url)
+        .json(&DeviceCodeBody { app_name: APP_NAME, machine_id })
+        .send()
+        .await
+        .context("POST /api/v1/auth/device/code")?;
+    if !code_resp.status().is_success() {
+        let status = code_resp.status();
+        let body = code_resp.text().await.unwrap_or_default();
+        bail!("device-code request failed: {status} {body}");
+    }
+    let dc: DeviceCodeResp = code_resp.json().await.context("parsing /device/code response")?;
+
+    // Step 2: tell the operator what to do.
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!("To authenticate, open this URL on ANY browser (phone, laptop,");
+    eprintln!("anything with a browser and internet):");
+    eprintln!();
+    eprintln!("    {}", dc.verification_uri);
+    eprintln!();
+    eprintln!("And enter this code:");
+    eprintln!();
+    eprintln!("    {}", dc.user_code);
+    eprintln!();
+    eprintln!("Or use this single-link shortcut (code pre-filled):");
+    eprintln!();
+    eprintln!("    {}", dc.verification_uri_complete);
+    eprintln!();
+    eprintln!("Waiting for authorization (expires in {}s)...", dc.expires_in);
+    eprintln!("============================================================");
+
+    // Step 3: poll /device/token until success / expiry.
+    let token_url = Url::parse(hub_url)?.join("/api/v1/auth/device/token")?;
+    let interval = Duration::from_secs(dc.interval.max(1));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(dc.expires_in);
+    let mut effective_interval = interval;
+
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            bail!("device code expired before authorization completed");
+        }
+        tokio::time::sleep(effective_interval).await;
+
+        let resp = client.post(token_url.clone())
+            .json(&DevicePollBody { device_code: &dc.device_code })
+            .send()
+            .await
+            .context("POST /api/v1/auth/device/token")?;
+
+        if resp.status().is_success() {
+            let body: DevicePollSuccess = resp.json().await.context("parsing /device/token success response")?;
+            eprintln!();
+            eprintln!("Authorization received. Persisting token.");
+            return Ok(body.access_token);
+        }
+
+        // Expected 400-class responses with a typed error field, per
+        // RFC 8628. authorization_pending + slow_down are normal
+        // states the client should keep polling; expired_token /
+        // access_denied / invalid_grant are terminal.
+        let body: DevicePollError = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(?e, "could not parse /device/token error body; treating as transient");
+                continue;
+            }
+        };
+        match body.error.as_str() {
+            "authorization_pending" => {
+                // Quiet wait — only print a dot every 30s so we don't
+                // spam stderr.
+                continue;
+            }
+            "slow_down" => {
+                // RFC 8628: increase interval by 5s on slow_down.
+                effective_interval += Duration::from_secs(5);
+                continue;
+            }
+            "expired_token" => bail!("device code expired; restart `login` to mint a fresh code"),
+            "access_denied" => bail!("authorization denied"),
+            "invalid_grant" => bail!("device code invalid or already consumed; restart `login`"),
+            other            => bail!("unexpected device flow error: {other}"),
+        }
+    }
+}
+
+/// Run the OAuth flow (browser + callback variant). Returns the
+/// minted `cw_app_…` token.
 ///
 /// `machine_id` is forwarded as a query param on /spa/start so the
 /// hub can stamp it on the resulting token row. Re-auth from the
 /// same machine_id revokes the prior token (no orphan accumulation),
 /// and `claw desktop delete` uses it for FK-style cleanup.
+///
+/// Requires a working browser on the SAME machine (the callback URL
+/// is `http://127.0.0.1:<port>` and only reachable from local
+/// loopback). For headless installs, use `run_device_flow` instead.
 pub async fn run_oauth_flow(hub_url: &str, machine_id: &str) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await
         .context("binding loopback for OAuth callback")?;
