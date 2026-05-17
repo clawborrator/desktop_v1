@@ -245,8 +245,31 @@ fn spawn_cc(folder: &PathBuf, mcp_path: &PathBuf, extra_flags: &[String]) -> Res
     // CC's startup banner emit 24-bit color escape sequences.
     cmd.env("TERM",      "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // On Linux, ensure $HOME/.local/bin is on PATH for the spawned CC
+    // process. The official Claude installer (curl ... claude.ai/install.sh)
+    // drops `claude` there, but systemd user services don't include
+    // that path by default. The install-task unit template now sets
+    // PATH explicitly to cover this — this runtime prepend is belt-
+    // and-suspenders for installs that haven't re-run install-task
+    // yet OR that run the supervisor outside systemd entirely (cargo
+    // run, manual invocation, etc.).
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut local_bin = std::path::PathBuf::from(home);
+            local_bin.push(".local");
+            local_bin.push("bin");
+            let existing = std::env::var_os("PATH").unwrap_or_default();
+            let mut new_path = std::ffi::OsString::from(local_bin);
+            if !existing.is_empty() {
+                new_path.push(":");
+                new_path.push(&existing);
+            }
+            cmd.env("PATH", new_path);
+        }
+    }
     let child = pty.slave.spawn_command(cmd)
-        .map_err(|e| anyhow!("spawn claude: {e}"))?;
+        .map_err(|e| anyhow!("spawn claude: {e} (is the `claude` CLI installed and on PATH? install with `curl -fsSL https://claude.ai/install.sh | bash` then re-run `clawborrator-supervisor install-task` to update the systemd unit)"))?;
     // We can drop the slave handle now — the spawned child holds
     // the only reference that matters.
     drop(pty.slave);
