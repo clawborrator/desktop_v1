@@ -29,6 +29,7 @@ pub fn default_plugins() -> Vec<Box<dyn ParserPlugin>> {
         Box::new(DevChannels),
         Box::new(McpServer),
         Box::new(BypassPermissions),
+        Box::new(EnableAutoMode),
     ]
 }
 
@@ -142,6 +143,32 @@ impl ParserPlugin for McpServer {
 }
 
 // === Arrow-down-then-Enter plugin =============================
+
+/// "Enable auto mode?" — three-option prompt CC shows on first
+/// session start. Default highlight is option 1 ("Yes, and make it
+/// my default mode"). We confirm with Enter so:
+///   - the session enables auto mode (Claude can self-approve safe
+///     tool calls; risky ones are blocked, which is what a managed
+///     supervisor session wants since there's no operator at the TUI)
+///   - the choice persists so we don't see this prompt every session
+///
+/// Option 3 ("No, exit") EXITS the entire CC process — we must NOT
+/// land on it. The option=1 highlight gate ensures we only Enter
+/// when the safe default is selected.
+///
+/// Sentinel pair keeps this from false-matching: "Enable auto mode?"
+/// is the heading, "make it my default mode" is unique to this
+/// prompt's option 1.
+pub struct EnableAutoMode;
+impl ParserPlugin for EnableAutoMode {
+    fn name(&self) -> &'static str { "enable-auto-mode" }
+    fn inspect(&self, screen: &ScreenView) -> Option<Action> {
+        if !screen.contains("Enable auto mode?") { return None; }
+        if !screen.contains("make it my default mode") { return None; }
+        let (_, opt) = screen.highlighted_option()?;
+        if opt == 1 { Some(Action::WriteBytes(b"\r".to_vec())) } else { None }
+    }
+}
 
 /// `--dangerously-skip-permissions` warning. CC defaults the highlight
 /// to option 1 ("No, exit") to make the dangerous path explicit. We
